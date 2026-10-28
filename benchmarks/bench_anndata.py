@@ -5,6 +5,8 @@ PIPELINE is `default` (zarr's BatchedCodecPipeline, CPU decode) or `kvikio`.
 Set KVIKIO_NTHREADS to control KvikIO's read parallelism.
 """
 
+from __future__ import annotations
+
 import sys
 import time
 import warnings

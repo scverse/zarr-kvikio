@@ -96,7 +96,7 @@ def convert_array(
     if (chunks is None) != (shards is None):
         msg = "Give both `chunks` and `shards`, or neither."
         raise ValueError(msg)
-    if chunks is None:
+    if chunks is None or shards is None:
         chunks, shards = layout(
             src.shape, dtype.itemsize, chunk_bytes=chunk_bytes, chunks_per_shard=chunks_per_shard
         )
@@ -183,7 +183,7 @@ _HOST_BUFFERS = {"buffer": "zarr.buffer.cpu.Buffer", "ndbuffer": "zarr.buffer.cp
 
 
 def _write_pipeline() -> ConfigSet:
-    """zarr's fused pipeline, for the arrays created within.
+    """The fused zarr pipeline, for the arrays created within.
 
     It stores the chunks of a shard in order, so a contiguous range is one read. zarrs (faster
     at writing) stores them in whatever order they were compressed in, scattering a range

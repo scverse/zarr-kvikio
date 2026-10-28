@@ -29,7 +29,8 @@ def enable(client: Client, *, num_threads: int = 8) -> _ClusterConfigSet:
     ``with`` block, here and on the workers::
 
         zarr_kvikio.dask.enable(client)
-        with zarr_kvikio.dask.enable(client): ...
+        with zarr_kvikio.dask.enable(client):
+            ...
 
     Parameters
     ----------
@@ -61,9 +62,11 @@ class KvikioPlugin(WorkerPlugin):
         self.host_pipeline = host_pipeline
 
     def setup(self, worker) -> None:
+        """Switch GPU reads on in the worker."""
         self._config = _enable(self.num_threads, self.host_pipeline)
 
     def teardown(self, worker) -> None:
+        """Undo :meth:`setup` and free the decoders' GPU memory."""
         from ._pipeline import release_memory
 
         if (config := getattr(self, "_config", None)) is not None:  # set up

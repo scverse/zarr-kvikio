@@ -30,7 +30,7 @@ from functools import cached_property
 from itertools import product
 from math import prod
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import google_crc32c
 import numpy as np
@@ -46,7 +46,7 @@ from zarr.storage import LocalStore, StorePath
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Sequence
 
-    from zarr.abc.codec import CodecPipeline
+    from zarr.abc.codec import ArrayArrayCodec, ArrayBytesCodec, BytesBytesCodec, CodecPipeline
     from zarr.abc.store import ByteGetter, ByteSetter, Store
     from zarr.core.buffer import NDBuffer
     from zarr.core.indexing import SelectorTuple
@@ -189,7 +189,7 @@ class KvikioCodecPipeline(BatchedCodecPipeline):
 
         pipeline = create_codec_pipeline(array_metadata)
         pipeline.__dict__["_array"] = (array_metadata, store)
-        return pipeline
+        return cast("KvikioCodecPipeline", pipeline)
 
     async def read(
         self,
@@ -200,7 +200,7 @@ class KvikioCodecPipeline(BatchedCodecPipeline):
         batch = list(batch_info)
         if not batch:
             return ()
-        out_arr = out.as_ndarray_like()
+        out_arr: Any = out.as_ndarray_like()
         if not _is_device_array(out_arr):
             return await self._host_pipeline(batch[0][1]).read(batch, out, drop_axes)
         if not all(_supported_dtype(spec) for _, spec, *_ in batch):
@@ -209,13 +209,14 @@ class KvikioCodecPipeline(BatchedCodecPipeline):
         paths = [_local_path(bg) for bg, *_ in batch]
         if layout is None or any(p is None for p in paths):
             return await self._read_via_host(batch, out_arr, drop_axes)
+        local = cast("list[Path]", paths)
         if out_arr.nbytes < int(os.environ.get(_MIN_BYTES_ENV, _DEFAULT_MIN_BYTES)):
-            return await self._read_small(batch, paths, out_arr, drop_axes)
+            return await asyncio.to_thread(_read_host, layout, batch, local, out_arr, drop_axes)
         if _contiguous_reads(layout, batch, out_arr, drop_axes):
-            results = await asyncio.to_thread(_read_gpu_contiguous, layout, batch, paths, out_arr)
+            results = await asyncio.to_thread(_read_gpu_contiguous, layout, batch, local, out_arr)
             if results is not None:
                 return results
-        return await asyncio.to_thread(_read_gpu, layout, batch, paths, out_arr, drop_axes)
+        return await asyncio.to_thread(_read_gpu, layout, batch, local, out_arr, drop_axes)
 
     async def write(
         self,
@@ -242,11 +243,11 @@ class KvikioCodecPipeline(BatchedCodecPipeline):
                         array_metadata=metadata, store=store
                     )
             if pipeline is None:
-                codecs = (
+                codecs: list[ArrayArrayCodec | ArrayBytesCodec | BytesBytesCodec] = [
                     *self.array_array_codecs,
                     self.array_bytes_codec,
                     *self.bytes_bytes_codecs,
-                )
+                ]
                 pipeline = host_cls.from_codecs(codecs)
                 pipeline = pipeline.evolve_from_array_spec(_on_host(spec))
             # (a frozen dataclass: cache it the way `cached_property` does)
@@ -260,22 +261,13 @@ class KvikioCodecPipeline(BatchedCodecPipeline):
         import cupy as cp
 
         host = _HostNDBuffer.from_numpy_array(np.empty(out_arr.shape, dtype=out_arr.dtype))
-        host_batch = [
-            (bg, _on_host(spec), chunk_sel, out_sel, *rest)
-            for bg, spec, chunk_sel, out_sel, *rest in batch
+        host_batch: list[BatchInfo] = [
+            (bg, _on_host(spec), chunk_sel, out_sel, is_complete)
+            for bg, spec, chunk_sel, out_sel, is_complete in batch
         ]
         results = await self._host_pipeline(batch[0][1]).read(host_batch, host, drop_axes)
         out_arr[...] = cp.asarray(host.as_ndarray_like())
         return results
-
-    async def _read_small(
-        self,
-        batch: list[BatchInfo],
-        paths: list[Path],
-        out_arr: Any,
-        drop_axes: tuple[int, ...],
-    ) -> tuple[GetResult, ...]:
-        return await asyncio.to_thread(_read_host, self._layout, batch, paths, out_arr, drop_axes)
 
 
 def _host_pipeline_class() -> type[CodecPipeline]:
@@ -450,7 +442,7 @@ class _Entry:
     """How one entry of the batch gets into the output."""
 
     spec: ArraySpec
-    chunk_selection: SelectorTuple
+    chunk_selection: tuple[Any, ...]  # normalized (`_normalize`)
     out_selection: SelectorTuple
     missing: bool = False
     # Region mode: decoded bounding box of the selected part of the chunk, and its offset
@@ -649,6 +641,7 @@ def _plan_contiguous(
         shard_len = spec.shape[0]
         cs = chunk_sel[0] if isinstance(chunk_sel, tuple) else chunk_sel
         os_ = out_sel[0] if isinstance(out_sel, tuple) else out_sel
+        assert isinstance(cs, slice) and isinstance(os_, slice)  # see `_contiguous_reads`
         start, stop, _ = cs.indices(shard_len)
         out_start = os_.start or 0
         if stop <= start:
@@ -855,13 +848,16 @@ def _plan(
         stored = [
             (
                 tuple(i * c for i, c in zip(coords, stored_shape, strict=True)),
-                *(int(v) for v in index[coords]),
+                int(index[coords][0]),
+                int(index[coords][1]),
             )
             for coords in product(*touched)
         ]
     direct = _contiguous_1d(out, chunk_sel, out_sel, drop_axes)
-    plan = _plan_direct if direct is not None else _plan_region
-    plan(entry, path, stored, stored_shape, out=out, direct=direct, pieces=pieces)
+    if direct is not None:
+        _plan_direct(entry, path, stored, stored_shape, out=out, direct=direct, pieces=pieces)
+    else:
+        _plan_region(entry, path, stored, stored_shape, out=out, direct=None, pieces=pieces)
     return entry
 
 
@@ -1007,7 +1003,7 @@ def _touched_chunks(sel: Any, chunk_len: int, n_chunks: int) -> list[int]:
 
 def _shift(sel: tuple[Any, ...], origin: tuple[int, ...]) -> tuple[Any, ...]:
     """Express a selection within a chunk relative to a region starting at ``origin``."""
-    shifted = []
+    shifted: list[Any] = []
     for s, o in zip(sel, origin, strict=True):
         if isinstance(s, slice):
             shifted.append(slice(s.start - o, s.stop - o, s.step))

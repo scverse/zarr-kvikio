@@ -35,7 +35,8 @@ def enable(*, num_threads: int | None = 8) -> ConfigSet:
     Applies right away, or only within a ``with`` block::
 
         zarr_kvikio.enable()
-        with zarr_kvikio.enable(): ...
+        with zarr_kvikio.enable():
+            ...
 
     The GPU decodes chunks that are zstd-compressed (or uncompressed), ideally sharded with
     small inner chunks (see :func:`convert_array` and :func:`describe`). Other chunks

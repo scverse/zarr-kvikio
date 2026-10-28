@@ -5,13 +5,15 @@ import shutil
 import subprocess
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
-import zarr
 
 from ._config import available
 from ._pipeline import _MAX_UINT_64, KvikioCodecPipeline, _layout_of, _read_shard_index
+
+if TYPE_CHECKING:
+    import zarr
 
 # nvCOMP decodes every zstd frame (= chunk) with one thread block, so large chunks decode slowly.
 _MAX_GOOD_CHUNK_BYTES = 1 << 20
@@ -78,7 +80,12 @@ def _shard_unordered(arr: zarr.Array, layout: Any) -> bool:
     """
     from zarr.storage import LocalStore
 
-    if arr.ndim != 1 or layout.inner_chunk_shape is None or not isinstance(arr.store, LocalStore):
+    if (
+        arr.ndim != 1
+        or arr.shards is None
+        or layout.inner_chunk_shape is None
+        or not isinstance(arr.store, LocalStore)
+    ):
         return False
     path = Path(arr.store.root) / arr.path / arr.metadata.encode_chunk_key((0,) * arr.ndim)
     if not path.exists():
