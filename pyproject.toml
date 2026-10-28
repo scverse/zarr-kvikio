@@ -4,7 +4,9 @@ requires = [ "hatch-vcs", "hatchling" ]
 
 [project]
 name = "zarr-kvikio"
-description = "A zarr-python codec pipeline that reads chunks straight into GPU memory with KvikIO and decodes them with nvCOMP"
+description = """\
+  A zarr-python codec pipeline that reads chunks straight into GPU memory with KvikIO and decodes them with nvCOMP\
+  """
 readme = "README.md"
 license = "MIT"
 license-files = [ "LICENSE" ]
@@ -45,16 +47,12 @@ dev = [ "pre-commit" ]
 test = [ "distributed", "pytest", "pytest-cov" ]
 typecheck = [ "mypy" ]
 
-[tool.hatch.version]
-source = "vcs"
-raw-options.version_scheme = "guess-next-dev"
-raw-options.local_scheme = "no-local-version"
-
-[tool.hatch.build.targets.wheel]
-packages = [ "src/zarr_kvikio" ]
-
-[tool.hatch.build.targets.sdist]
-include = [ "/src", "/tests", "/CHANGELOG.md", "/LICENSE", "/README.md" ]
+[tool.hatch]
+version.source = "vcs"
+version.raw-options.local_scheme = "no-local-version"
+version.raw-options.version_scheme = "guess-next-dev"
+build.targets.wheel.packages = [ "src/zarr_kvikio" ]
+build.targets.sdist.include = [ "/src", "/tests", "/CHANGELOG.md", "/LICENSE", "/README.md" ]
 
 [tool.ruff]
 line-length = 100
@@ -90,13 +88,8 @@ lint.isort.known-first-party = [ "zarr_kvikio" ]
 lint.isort.required-imports = [ "from __future__ import annotations" ]
 lint.pydocstyle.convention = "numpy"
 
-[tool.pytest.ini_options]
-testpaths = [ "tests" ]
-addopts = [ "--import-mode=importlib", "--strict-markers", "-ra" ]
-xfail_strict = true
-
-[tool.coverage.run]
-source_pkgs = [ "zarr_kvikio" ]
+[tool.pyproject-fmt]
+max_supported_python = "3.14"
 
 [tool.mypy]
 files = [ "src" ]
@@ -111,7 +104,6 @@ warn_unused_configs = true
 module = [
   "cupy",
   "cupyx",
-  "cupyx.*",
   "distributed",
   "distributed.*",
   "donfig.*",
@@ -124,3 +116,11 @@ module = [
   "zarrs",
 ]
 ignore_missing_imports = true
+
+[tool.pytest]
+ini_options.testpaths = [ "tests" ]
+ini_options.addopts = [ "--import-mode=importlib", "--strict-markers", "-ra" ]
+ini_options.xfail_strict = true
+
+[tool.coverage]
+run.source_pkgs = [ "zarr_kvikio" ]
