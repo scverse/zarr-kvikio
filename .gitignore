@@ -1,22 +1,5 @@
-# Temp files
-.DS_Store
-*~
-buck-out/
-
-# Compiled files
 .venv/
-uv.lock
 __pycache__/
-.*cache/
-
-# Distribution / packaging
-/dist/
-
-# Tests and coverage
-/data/
-/node_modules/
-/.coverage*
-
-# docs
-/docs/generated/
-/docs/_build/
+*.egg-info/
+.pytest_cache/
+cufile.log

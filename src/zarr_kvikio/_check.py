@@ -1,0 +1,152 @@
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import zarr
+
+from ._config import available
+from ._pipeline import _MAX_UINT_64, KvikioCodecPipeline, _layout_of, _read_shard_index
+
+# nvCOMP decodes every zstd frame (= chunk) with one thread block, so large chunks decode slowly.
+_MAX_GOOD_CHUNK_BYTES = 1 << 20
+
+
+def check() -> dict[str, Any]:
+    """Whether arrays can be read into GPU memory here: KvikIO, nvCOMP and GPUDirect Storage.
+
+    Returns ``{"available": ..., "versions": {...}, "gds": {...}}``. GPUDirect Storage is read
+    from ``gdscheck -p``: without it, KvikIO reads through the page cache and a bounce buffer,
+    which still works (and is fast for cached data), but isn't direct NVMe to GPU DMA.
+    """
+    return {
+        "available": available(),
+        "versions": {pkg: _version(pkg) for pkg in ("kvikio", "nvidia-nvcomp", "zarr", "cupy")},
+        "gds": _gds_status(),
+    }
+
+
+def describe(arr: zarr.Array) -> dict[str, Any]:
+    """Describe the layout of `arr` and list what keeps it from being read fast on the GPU.
+
+    Returns its dtype, zarr format, codecs, chunk size and whether it is sharded, plus
+    ``gpu_readable`` (whether the GPU can decode its chunks) and ``problems``
+    (see :func:`convert_array` for a layout without them).
+    """
+    desc: dict[str, Any] = {
+        "dtype": str(arr.dtype),
+        "zarr_format": arr.metadata.zarr_format,
+        "codecs": [type(c).__name__ for c in _codecs(arr)],
+        "chunk_bytes": int(np.prod(arr.chunks)) * arr.dtype.itemsize,
+        "sharded": arr.shards is not None,
+    }
+    problems = []
+    layout = None
+    if arr.metadata.zarr_format == 3:
+        layout = _layout_of(KvikioCodecPipeline.from_codecs(arr.metadata.codecs))
+    if layout is None:
+        problems.append(
+            f"codecs {desc['codecs']} cannot be decoded on the GPU "
+            "(needs zarr v3 with zstd or no compression)"
+        )
+    if desc["chunk_bytes"] > _MAX_GOOD_CHUNK_BYTES:
+        problems.append(
+            f"chunks of {desc['chunk_bytes'] / 2**20:.1f} MiB decode slowly on the GPU "
+            "(~256 KiB is best)"
+        )
+    if not desc["sharded"] and arr.nchunks > 1:
+        problems.append("not sharded: every chunk is a separate file, which slows down small reads")
+    if layout is not None and _shard_unordered(arr, layout):
+        problems.append(
+            "the chunks inside its shards are stored out of order (as zarrs writes them), "
+            "so a contiguous range needs many small reads"
+        )
+    desc["gpu_readable"] = layout is not None
+    desc["problems"] = problems
+    return desc
+
+
+def _shard_unordered(arr: zarr.Array, layout: Any) -> bool:
+    """Whether the inner chunks of the first shard of a 1-D array are stored out of order.
+
+    Only for local stores. (zarr stores the chunks of N-D shards in Morton order.)
+    """
+    from zarr.storage import LocalStore
+
+    if arr.ndim != 1 or layout.inner_chunk_shape is None or not isinstance(arr.store, LocalStore):
+        return False
+    path = Path(arr.store.root) / arr.path / arr.metadata.encode_chunk_key((0,) * arr.ndim)
+    if not path.exists():
+        return False
+    per_shard = tuple(s // c for s, c in zip(arr.shards, layout.inner_chunk_shape, strict=True))
+    index = _read_shard_index(layout, path, path.stat().st_size, per_shard)
+    offsets = index[..., 0].ravel()
+    offsets = offsets[offsets != _MAX_UINT_64].astype(np.int64)
+    return bool((np.diff(offsets) < 0).any())
+
+
+def _codecs(arr: zarr.Array) -> list[Any]:
+    if arr.metadata.zarr_format == 3:
+        from zarr.codecs import ShardingCodec
+
+        # describe what is inside the shards
+        return [
+            c
+            for codec in arr.metadata.codecs
+            for c in (codec.codecs if isinstance(codec, ShardingCodec) else [codec])
+        ]
+    return [c for c in (*arr.filters, *arr.compressors) if c is not None]
+
+
+def _version(pkg: str) -> str | None:
+    try:
+        return version(pkg)
+    except PackageNotFoundError:
+        # pip names e.g. nvCOMP's bindings and CuPy by CUDA version
+        for suffix in ("-cu13", "-cu12", "-cuda13x", "-cuda12x"):
+            try:
+                return version(pkg + suffix)
+            except PackageNotFoundError:
+                pass
+        return None
+
+
+def _gds_status() -> dict[str, Any]:
+    exe = shutil.which("gdscheck") or next(
+        (
+            p
+            for p in (
+                Path(os.environ.get("CUDA_HOME", "/usr/local/cuda")) / "gds/tools/gdscheck",
+                Path("/usr/local/cuda/gds/tools/gdscheck"),
+            )
+            if p.exists()
+        ),
+        None,
+    )
+    if exe is None:
+        return {"status": "unknown (gdscheck not found)"}
+    try:
+        out = subprocess.run(
+            [str(exe), "-p"], capture_output=True, text=True, timeout=60, check=False
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"status": f"unknown ({e})"}
+    fields = {}
+    for line in out.splitlines():
+        key, sep, value = line.partition(":")
+        if sep:
+            fields[key.strip()] = value.strip()
+    nvme = fields.get("NVMe", "")
+    p2pdma = fields.get("properties.use_pci_p2pdma", "").lower() == "true"
+    # (not `in`: gdscheck also reports "Unsupported")
+    direct = nvme.lower().startswith("supported") or p2pdma
+    return {
+        "status": "direct" if direct else "compatibility mode",
+        "nvme": nvme or None,
+        "use_pci_p2pdma": p2pdma,
+    }
