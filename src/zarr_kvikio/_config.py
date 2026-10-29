@@ -1,14 +1,11 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
 from importlib.util import find_spec
-from typing import TYPE_CHECKING
 
 import zarr
 
 from ._pipeline import HOST_PIPELINE_KEY
-
-if TYPE_CHECKING:
-    from donfig.config_obj import ConfigSet
 
 PIPELINE_PATH = "zarr_kvikio.KvikioCodecPipeline"
 INSTALL_HINT = (
@@ -29,7 +26,7 @@ def require() -> None:
         raise ImportError(INSTALL_HINT)
 
 
-def enable(*, num_threads: int | None = 8) -> ConfigSet:
+def enable(*, num_threads: int | None = 8) -> ExitStack:
     """Read zarr arrays into GPU memory with KvikIO and nvCOMP, in this process.
 
     Applies right away, or only within a ``with`` block::
@@ -37,6 +34,9 @@ def enable(*, num_threads: int | None = 8) -> ConfigSet:
         zarr_kvikio.enable()
         with zarr_kvikio.enable():
             ...
+
+    As with ``zarr.config.set``, nested calls must be undone in reverse order, also relative to
+    :func:`zarr_kvikio.dask.enable` in this process.
 
     The GPU decodes chunks that are zstd-compressed (or uncompressed), ideally sharded with
     small inner chunks (see :func:`convert_array` and :func:`describe`). Other chunks
@@ -54,19 +54,24 @@ def enable(*, num_threads: int | None = 8) -> ConfigSet:
     return _enable(num_threads, _host_pipeline())
 
 
-def _enable(num_threads: int | None, host_pipeline: str | None) -> ConfigSet:
+def _enable(num_threads: int | None, host_pipeline: str | None) -> ExitStack:
+    # both settings apply right away; exiting the stack undoes them in reverse order
+    stack = ExitStack()
     if num_threads is not None:
         import kvikio.defaults
 
-        kvikio.defaults.set({"num_threads": num_threads})
-    return zarr.config.set(
-        {
-            "codec_pipeline.path": PIPELINE_PATH,
-            HOST_PIPELINE_KEY: host_pipeline,
-            "buffer": "zarr.buffer.gpu.Buffer",
-            "ndbuffer": "zarr.buffer.gpu.NDBuffer",
-        }
+        stack.push(kvikio.defaults.set({"num_threads": num_threads}))
+    stack.push(
+        zarr.config.set(
+            {
+                "codec_pipeline.path": PIPELINE_PATH,
+                HOST_PIPELINE_KEY: host_pipeline,
+                "buffer": "zarr.buffer.gpu.Buffer",
+                "ndbuffer": "zarr.buffer.gpu.NDBuffer",
+            }
+        )
     )
+    return stack
 
 
 def _host_pipeline() -> str | None:

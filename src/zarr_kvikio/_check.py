@@ -23,13 +23,25 @@ def check() -> dict[str, Any]:
     """Whether arrays can be read into GPU memory here: KvikIO, nvCOMP and GPUDirect Storage.
 
     Returns ``{"available": ..., "versions": {...}, "gds": {...}}``. GPUDirect Storage is read
-    from ``gdscheck -p``: without it, KvikIO reads through the page cache and a bounce buffer,
-    which still works (and is fast for cached data), but isn't direct NVMe to GPU DMA.
+    from ``gdscheck -p`` and KvikIO's compatibility mode (as ``gds["kvikio_compat_mode"]``, only
+    if :func:`available`; on with ``KVIKIO_COMPAT_MODE=ON`` or without a usable cuFile). Without
+    GPUDirect Storage, KvikIO reads through the page cache and a bounce buffer, which still works
+    (and is fast for cached data), but isn't direct NVMe to GPU DMA. Contiguous reads of
+    zstd-compressed sharded 1-D arrays only use KvikIO with ``ZARR_KVIKIO_FETCH=kvikio``.
     """
+    gds = _gds_status()
+    if available():
+        import kvikio.defaults
+
+        # e.g. KVIKIO_COMPAT_MODE=ON, or no usable cuFile: KvikIO doesn't use GDS, whatever
+        # gdscheck says
+        gds["kvikio_compat_mode"] = bool(kvikio.defaults.is_compat_mode_preferred())
+        if gds["kvikio_compat_mode"]:
+            gds["status"] = "compatibility mode"
     return {
         "available": available(),
         "versions": {pkg: _version(pkg) for pkg in ("kvikio", "nvidia-nvcomp", "zarr", "cupy")},
-        "gds": _gds_status(),
+        "gds": gds,
     }
 
 
@@ -40,6 +52,8 @@ def describe(arr: zarr.Array) -> dict[str, Any]:
     ``gpu_readable`` (whether the GPU can decode its chunks) and ``problems``
     (see :func:`convert_array` for a layout without them).
     """
+    from zarr.storage import LocalStore
+
     desc: dict[str, Any] = {
         "dtype": str(arr.dtype),
         "zarr_format": arr.metadata.zarr_format,
@@ -53,8 +67,13 @@ def describe(arr: zarr.Array) -> dict[str, Any]:
         layout = _layout_of(KvikioCodecPipeline.from_codecs(arr.metadata.codecs))
     if layout is None:
         problems.append(
-            f"codecs {desc['codecs']} cannot be decoded on the GPU "
-            "(needs zarr v3 with zstd or no compression)"
+            f"codecs {desc['codecs']} cannot be decoded on the GPU (needs zarr v3 with "
+            "little-endian bytes, zstd without checksum or no compression, and no other codecs)"
+        )
+    if type(arr.store) is not LocalStore:  # (the exact type, as in `_local_path`)
+        problems.append(
+            f"stored in a {type(arr.store).__name__}, not a LocalStore: "
+            "its chunks are decoded on the CPU"
         )
     if desc["chunk_bytes"] > _MAX_GOOD_CHUNK_BYTES:
         problems.append(
