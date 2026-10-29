@@ -18,8 +18,8 @@ copied to the GPU at once. (The settings are keys of zarr's config.)
 Everything else works with any store: reads into host buffers and writes of host buffers are
 delegated to a host pipeline (``kvikio.host_pipeline``, e.g. zarrs, else zarr's
 :class:`~zarr.core.codec_pipeline.FusedCodecPipeline`), and reads into GPU buffers the GPU can't
-decode (e.g. blosc-compressed or remote chunks) are decoded by it on the host and then copied.
-Writes of GPU buffers, and reads of other data types (e.g. strings) into them, use zarr's
+decode (e.g. blosc-compressed or remote chunks, or structured data types) are decoded by it on the
+host and then copied. Writes of GPU buffers use zarr's
 :class:`~zarr.core.codec_pipeline.BatchedCodecPipeline`.
 """
 
@@ -172,8 +172,7 @@ class KvikioCodecPipeline(BatchedCodecPipeline):
     Reads into host buffers and writes of host buffers go to the pipeline in zarr's config
     ``kvikio.host_pipeline`` (e.g. zarrs), or else to zarr's
     :class:`~zarr.core.codec_pipeline.FusedCodecPipeline`, which also decodes the reads into GPU
-    buffers that the GPU can't (copied afterwards).
-    Writes of GPU buffers, and reads of other data types (e.g. strings) into them, go to zarr's
+    buffers that the GPU can't (copied afterwards). Writes of GPU buffers go to zarr's
     :class:`~zarr.core.codec_pipeline.BatchedCodecPipeline`. So the pipeline works with any array.
 
     zarr finds it (as ``"zarr_kvikio.KvikioCodecPipeline"``) through an entry point.
@@ -217,7 +216,8 @@ class KvikioCodecPipeline(BatchedCodecPipeline):
         if not _is_device_array(out_arr):
             return await self._host_pipeline(batch[0][1]).read(batch, out, drop_axes)
         if not all(_supported_dtype(spec) for _, spec, *_ in batch):
-            return await super().read(batch, out, drop_axes)
+            # (e.g. structured: zarr's codecs can't decode them on the GPU)
+            return await self._read_via_host(batch, out_arr, drop_axes)
         layout = self._layout
         paths = [_local_path(bg) for bg, *_ in batch]
         # (zarr also takes an `out` of another dtype: `_read_via_host` casts into it)

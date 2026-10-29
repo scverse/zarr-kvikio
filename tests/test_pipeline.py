@@ -241,9 +241,10 @@ def test_unsupported_codecs_fall_back(tmp_path, fast_path_calls, fused_reads, co
     assert set(fused_reads) == {"host"}
 
 
-def test_zarr_v2_falls_back(tmp_path, fast_path_calls, fused_reads):
-    """Like most existing AnnData stores: zarr v2, blosc-compressed."""
-    data = rng.random((40, 30)).astype("float32")
+@pytest.mark.parametrize("dtype", ["float32", "V4", [("a", "u2"), ("b", "i2")]], ids=repr)
+def test_zarr_v2_falls_back(tmp_path, fast_path_calls, fused_reads, dtype):
+    """Like most existing AnnData stores: zarr v2, blosc-compressed (also of other data types)."""
+    data = rng.random((40, 30)).astype("float32").view(dtype)
     arr = zarr.create_array(
         tmp_path / "a.zarr",
         shape=data.shape,

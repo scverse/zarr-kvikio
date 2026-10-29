@@ -152,10 +152,9 @@ A read takes the fast path, which reads the stored bytes with KvikIO (or into pi
   (index codecs `bytes` + optional `crc32c`, index at the start or end).
 
 Everything else, including reads into host buffers and writes of host buffers, is handled by `kvikio.host_pipeline`
-(e.g. zarrs), or else zarr's `FusedCodecPipeline`. Reads into GPU buffers of arrays the GPU can't decode (e.g. blosc),
-or into GPU buffers of another data type than the array's, are decoded on the CPU and then copied. Writes of GPU
-buffers (every write while `enable()` is active), and reads of other data types (e.g. strings) into GPU buffers, go
-through zarr's `BatchedCodecPipeline`.
+(e.g. zarrs), or else zarr's `FusedCodecPipeline`. Reads into GPU buffers of arrays the GPU can't decode (e.g. blosc,
+or structured data types), or into GPU buffers of another data type than the array's, are decoded on the CPU and then
+copied. Writes of GPU buffers (every write while `enable()` is active) go through zarr's `BatchedCodecPipeline`.
 
 How a fast read works:
 
