@@ -20,6 +20,12 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
       - run: uv build
       - run: uvx twine check --strict dist/*
+      # the installed wheel's entry point loads the pipeline, and zarr works with it installed
+      - run: >-
+          uv run --isolated --no-project --with dist/*.whl python -c "import importlib.metadata as m, zarr, zarr_kvikio;
+          ep = m.entry_points(group='zarr.codec_pipeline')['zarr_kvikio.KvikioCodecPipeline'];
+          assert ep.load() is zarr_kvikio.KvikioCodecPipeline;
+          zarr.create_array(zarr.storage.MemoryStore(), shape=(1,), dtype='f4')"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist
