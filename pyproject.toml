@@ -38,7 +38,7 @@ optional-dependencies.cuda12 = [ "cupy-cuda12x>=13", "kvikio-cu12>=26.4", "nvidi
 optional-dependencies.cuda13 = [ "cupy-cuda13x>=13", "kvikio-cu13>=26.4", "nvidia-nvcomp-cu13>=5.2" ]
 # Client.register_plugin(..., name=...) is new in 2023.9.2
 optional-dependencies.dask = [ "distributed>=2023.9.2" ]
-urls.Changelog = "https://zarr-kvikio.readthedocs.io/page/changelog.html"
+urls.Changelog = "https://zarr-kvikio.readthedocs.io/page/release-notes/index.html"
 urls.Documentation = "https://zarr-kvikio.readthedocs.io/"
 urls.Homepage = "https://github.com/scverse/zarr-kvikio"
 urls.Issues = "https://github.com/scverse/zarr-kvikio/issues"
@@ -70,7 +70,7 @@ typecheck = [ "mypy" ]
 version.source = "vcs"
 version.raw-options.local_scheme = "no-local-version"
 version.raw-options.version_scheme = "guess-next-dev"
-build.targets.sdist.include = [ "/src", "/tests", "/CHANGELOG.md", "/LICENSE", "/README.md" ]
+build.targets.sdist.include = [ "/src", "/tests", "/LICENSE", "/README.md" ]
 build.targets.wheel.only-include = [ "src/_zarr_kvikio_entry.py", "src/zarr_kvikio" ]
 build.targets.wheel.sources = [ "src" ]
 envs.default.installer = "uv"

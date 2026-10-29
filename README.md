@@ -255,7 +255,8 @@ CPU tests, the type check, the lint hooks and a build; run the GPU tests locally
 
 To release, publish a GitHub release with a tag `vX.Y.Z`: the version comes from the tag
 (hatch-vcs), and `release.yaml` uploads it to PyPI through trusted publishing.
-Add the release's changes to [CHANGELOG.md](https://github.com/scverse/zarr-kvikio/blob/main/CHANGELOG.md) first.
+Add the release's changes to its [release notes](https://github.com/scverse/zarr-kvikio/tree/main/docs/release-notes)
+first (starting from `blank.md`, and listed in `index.md`), and replace `the-future` there with the release date.
 
 ## License
 

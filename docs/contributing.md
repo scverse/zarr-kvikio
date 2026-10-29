@@ -242,7 +242,8 @@ This means that local testing via hatch and remote testing on CI tests against t
 ### Updating the version number
 
 The version number comes from the release's git tag (with [hatch-vcs][]), so it isn't set in `pyproject.toml`.
-Add the release's changes to `CHANGELOG.md` first, and pick the version following [Semantic Versioning][semver], in brief
+Add the release's changes to its notes in `docs/release-notes/` first (starting from `blank.md`, and listed in
+`index.md`), and pick the version following [Semantic Versioning][semver], in brief
 
 > Given a version number MAJOR.MINOR.PATCH, increment the:
 >
@@ -252,7 +253,8 @@ Add the release's changes to `CHANGELOG.md` first, and pick the version followin
 >
 > Additional labels for pre-release and build metadata are available as extensions to the MAJOR.MINOR.PATCH format.
 
-Once you are done, commit and push your changes and navigate to the "Releases" page of this project on GitHub.
+Replace `the-future` with the release date in the release notes,
+commit and push your changes and navigate to the "Releases" page of this project on GitHub.
 Specify `vX.X.X` as a tag name and create a release.
 For more information, see [managing GitHub releases][].
 This will automatically create a git tag and trigger a Github workflow that creates a release on [PyPI][].

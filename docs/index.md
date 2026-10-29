@@ -7,7 +7,7 @@
 :maxdepth: 1
 
 api.md
-changelog.md
+release-notes/index.md
 contributing.md
 references.md
 ```

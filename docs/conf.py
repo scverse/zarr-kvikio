@@ -11,6 +11,8 @@ from datetime import datetime
 from importlib.metadata import metadata
 from pathlib import Path
 
+from docutils import nodes
+from docutils.parsers.rst import roles
 from sphinxcontrib import katex
 
 HERE = Path(__file__).parent
@@ -56,6 +58,7 @@ extensions = [
     "sphinx.ext.intersphinx",
     "sphinx.ext.autosummary",
     "sphinx.ext.napoleon",
+    "sphinx.ext.extlinks",
     "sphinxcontrib.bibtex",
     "sphinxcontrib.katex",
     "sphinx_autodoc_typehints",
@@ -109,7 +112,27 @@ intersphinx_mapping = {
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
 # This pattern also affects html_static_path and html_extra_path.
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "**.ipynb_checkpoints"]
+exclude_patterns = [
+    "_build",
+    "Thumbs.db",
+    ".DS_Store",
+    "**.ipynb_checkpoints",
+    # (a version's notes are included in release-notes/index.md; blank.md is the template for them)
+    "release-notes/[0-9]*.md",
+    "release-notes/blank.md",
+]
+
+# for the release notes
+extlinks = {
+    "issue": ("https://github.com/scverse/zarr-kvikio/issues/%s", "issue%s"),
+    "pr": ("https://github.com/scverse/zarr-kvikio/pull/%s", "pr%s"),
+}
+
+
+def setup(app):
+    """App setup hook."""
+    app.add_role("small", roles.GenericRole("small", nodes.inline))
+    app.add_role("smaller", roles.GenericRole("smaller", nodes.inline))
 
 
 # -- Options for HTML output -------------------------------------------------
