@@ -1,0 +1,37 @@
+name: Check Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          filter: blob:none
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+      - name: Build package
+        run: uv build
+      - name: Check package
+        run: uvx twine check --strict dist/*.whl
+      # the installed wheel's entry point loads the pipeline, and zarr works with it installed
+      - name: Check entry point
+        run: >-
+          uv run --isolated --no-project --with dist/*.whl python -c "import importlib.metadata as m, zarr, zarr_kvikio;
+          ep = m.entry_points(group='zarr.codec_pipeline')['zarr_kvikio.KvikioCodecPipeline'];
+          assert ep.load() is zarr_kvikio.KvikioCodecPipeline;
+          zarr.create_array(zarr.storage.MemoryStore(), shape=(1,), dtype='f4')"

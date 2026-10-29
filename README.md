@@ -1,5 +1,13 @@
 # zarr-kvikio
 
+[![Tests][badge-tests]][tests]
+[![Documentation][badge-docs]][documentation]
+
+[badge-tests]: https://img.shields.io/github/actions/workflow/status/scverse/zarr-kvikio/test.yaml?branch=main
+[badge-docs]: https://app.readthedocs.org/projects/zarr-kvikio/badge/
+[tests]: https://github.com/scverse/zarr-kvikio/actions/workflows/test.yaml
+[documentation]: https://zarr-kvikio.readthedocs.io
+
 A [zarr-python](https://github.com/zarr-developers/zarr-python) codec pipeline that reads chunks from a local file system
 straight into GPU memory with [KvikIO](https://github.com/rapidsai/kvikio) and decodes them with [nvCOMP](https://developer.nvidia.com/nvcomp).
 Reads it can't do on the GPU fall back to zarr's own pipelines, so any array can be read.
@@ -201,18 +209,21 @@ The CPU tests (no GPU stack) also run on Python 3.12 in CI.
 
 ## Development
 
+The project follows the [scverse cookiecutter template](https://github.com/scverse/cookiecutter-scverse)
+(see the [contributing guide](https://zarr-kvikio.readthedocs.io/page/contributing.html)):
+
 ```bash
-uv sync --extra cuda13 --extra dask --group test --group dev --group typecheck  # or --extra cuda12 (not both)
-uv run pre-commit install
-uv run pytest            # GPU tests skip without a CUDA GPU or the cuda extra
-uv run mypy
+hatch test               # GPU tests skip without a CUDA GPU or the cuda extra
+hatch check --fix        # lint, format and type check (prek hooks, mypy)
+hatch run docs:build
+uv run --extra cuda13 --extra dask --group test pytest  # with the GPU tests (or --extra cuda12)
 ```
 
 The tests compare every read against zarr's default CPU pipeline. GitHub's runners have no GPU, so CI runs the
 CPU tests, the type check, the lint hooks and a build; run the GPU tests locally before a release.
 
 To release, publish a GitHub release with a tag `vX.Y.Z`: the version comes from the tag
-(hatch-vcs), and `release.yml` uploads it to PyPI through trusted publishing.
+(hatch-vcs), and `release.yaml` uploads it to PyPI through trusted publishing.
 Add the release's changes to [CHANGELOG.md](https://github.com/scverse/zarr-kvikio/blob/main/CHANGELOG.md) first.
 
 ## License

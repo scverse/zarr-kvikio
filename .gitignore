@@ -1,16 +1,25 @@
-# environments and caches
-.venv/
-__pycache__/
-*.egg-info/
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
-.coverage
-coverage.xml
+# Temp files
+.DS_Store
+*~
+buck-out/
 
-# build output
+# Compiled files
+.venv/
+uv.lock
+__pycache__/
+.*cache/
+
+# Distribution / packaging
 /dist/
-/build/
+
+# Tests and coverage
+/data/
+/node_modules/
+/.coverage*
+
+# docs
+/docs/generated/
+/docs/_build/
 
 # KvikIO / cuFile logs
 cufile.log

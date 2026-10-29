@@ -1,0 +1,44 @@
+{
+  "template": "https://github.com/scverse/cookiecutter-scverse",
+  "commit": "e478c53bcf2589411df228b5d1d2b8a51bbf541d",
+  "checkout": null,
+  "context": {
+    "cookiecutter": {
+      "project_name": "zarr-kvikio",
+      "package_name": "zarr_kvikio",
+      "project_description": "A zarr-python codec pipeline that reads chunks straight into GPU memory with KvikIO and decodes them with nvCOMP",
+      "author_full_name": "Severin Dicks",
+      "author_email": "severin.dicks@scverse.org",
+      "github_user": "scverse",
+      "github_repo": "zarr-kvikio",
+      "license": "MIT License",
+      "ide_integration": true,
+      "issue_categorization": "labels",
+      "_copy_without_render": [
+        ".github/workflows/build.yaml",
+        ".github/workflows/test.yaml",
+        "docs/_templates/autosummary/**.rst"
+      ],
+      "_exclude_on_template_update": [
+        "CHANGELOG.md",
+        "LICENSE",
+        "README.md",
+        "docs/api.md",
+        "docs/index.md",
+        "docs/notebooks/example.ipynb",
+        "docs/references.bib",
+        "docs/references.md",
+        "src/**",
+        "tests/**"
+      ],
+      "_render_devdocs": false,
+      "_jinja2_env_vars": {
+        "lstrip_blocks": true,
+        "trim_blocks": true
+      },
+      "_template": "https://github.com/scverse/cookiecutter-scverse",
+      "_commit": "e478c53bcf2589411df228b5d1d2b8a51bbf541d"
+    }
+  },
+  "directory": null
+}

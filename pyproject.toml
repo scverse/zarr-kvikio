@@ -38,8 +38,9 @@ optional-dependencies.cuda12 = [ "cupy-cuda12x>=13", "kvikio-cu12>=26.4", "nvidi
 optional-dependencies.cuda13 = [ "cupy-cuda13x>=13", "kvikio-cu13>=26.4", "nvidia-nvcomp-cu13>=5.2" ]
 # Client.register_plugin(..., name=...) is new in 2023.9.2
 optional-dependencies.dask = [ "distributed>=2023.9.2" ]
-urls.Changelog = "https://github.com/scverse/zarr-kvikio/blob/main/CHANGELOG.md"
-urls.Documentation = "https://github.com/scverse/zarr-kvikio#readme"
+urls.Changelog = "https://zarr-kvikio.readthedocs.io/page/changelog.html"
+urls.Documentation = "https://zarr-kvikio.readthedocs.io/"
+urls.Homepage = "https://github.com/scverse/zarr-kvikio"
 urls.Issues = "https://github.com/scverse/zarr-kvikio/issues"
 urls.Source = "https://github.com/scverse/zarr-kvikio"
 # lets zarr find the pipeline by name in every process, without importing zarr_kvikio first;
@@ -47,8 +48,22 @@ urls.Source = "https://github.com/scverse/zarr-kvikio"
 entry-points."zarr.codec_pipeline"."zarr_kvikio.KvikioCodecPipeline" = "_zarr_kvikio_entry:KvikioCodecPipeline"
 
 [dependency-groups]
-dev = [ "pre-commit" ]
-test = [ "distributed", "pytest", "pytest-cov" ]
+dev = [ "twine>=4.0.2" ]
+test = [ "coverage>=7.10", "distributed", "pytest", "pytest-cov" ]
+doc = [
+  "ipykernel",
+  "ipython",
+  "myst-nb>=1.1",
+  "scverse-misc[sphinx]>=0.1.2",
+  "sphinx>=8.1",
+  "sphinx-autodoc-typehints",
+  "sphinx-book-theme>=1",
+  "sphinx-copybutton",
+  "sphinx-design",
+  "sphinxcontrib-bibtex>=1",
+  "sphinxcontrib-katex",
+  "sphinxext-opengraph",
+]
 typecheck = [ "mypy" ]
 
 [tool.hatch]
@@ -58,6 +73,33 @@ version.raw-options.version_scheme = "guess-next-dev"
 build.targets.sdist.include = [ "/src", "/tests", "/CHANGELOG.md", "/LICENSE", "/README.md" ]
 build.targets.wheel.only-include = [ "src/_zarr_kvikio_entry.py", "src/zarr_kvikio" ]
 build.targets.wheel.sources = [ "src" ]
+envs.default.installer = "uv"
+envs.default.dependency-groups = [ "dev" ]
+envs.docs.features = [ "dask" ]  # documents zarr_kvikio.dask
+envs.docs.scripts.build = "sphinx-build -M html docs docs/_build -W {args}"
+envs.docs.scripts.clean = "git clean -fdX -- {args:docs}"
+envs.docs.scripts.open = "python -m webbrowser -t docs/_build/html/index.html"
+envs.docs.dependency-groups = [ "doc" ]
+envs.hatch-check-code.dependencies = [ "prek" ]
+envs.hatch-check-code.scripts.lint-check = "echo 'try `hatch check code --fix`'; false"
+envs.hatch-check-code.scripts.lint-fix = "prek run -a --no-group=format --no-group=typecheck"
+envs.hatch-check-fmt.dependencies = [ "prek" ]
+envs.hatch-check-fmt.scripts.format-check = "echo 'try `hatch check fmt --fix`'; false"
+envs.hatch-check-fmt.scripts.format-fix = "prek run -a --group=format --no-group=typecheck"
+envs.hatch-check-types.scripts.check = [ "mypy" ]
+envs.hatch-check-types.dependency-groups = [ "typecheck", "test" ]
+envs.hatch-test.matrix = [
+  # Test the lowest and highest supported Python versions with normal deps
+  { deps = [ "stable" ], python = [ "3.12", "3.14" ] },
+  # Test the newest supported Python version also with pre-release deps
+  { deps = [ "pre" ], python = [ "3.14" ] },
+]
+# If the matrix variable `deps` is set to "pre",
+# set the environment variable `UV_PRERELEASE` to "allow".
+envs.hatch-test.overrides.matrix.deps.env-vars = [
+  { value = "allow", key = "UV_PRERELEASE", if = [ "pre" ] },
+]
+envs.hatch-test.dependency-groups = [ "dev", "test" ]
 
 # kvikio-cu12 and -cu13 need different cuda-toolkit majors: resolved together, uv would hold
 # kvikio back to a release without that requirement
@@ -67,6 +109,7 @@ conflicts = [ [ { extra = "cuda12" }, { extra = "cuda13" } ] ]
 [tool.ruff]
 line-length = 100
 src = [ "src" ]
+extend-include = [ "*.ipynb" ]
 format.docstring-code-format = true
 lint.select = [
   "B",   # flake8-bugbear
@@ -80,6 +123,7 @@ lint.select = [
   "RUF", # ruff-specific rules
   "SIM", # flake8-simplify
   "TC",  # type-checking blocks
+  "TID", # flake8-tidy-imports
   "UP",  # pyupgrade
   "W",   # pycodestyle warnings
 ]
@@ -93,6 +137,7 @@ lint.ignore = [
   "D401", # first line in imperative mood
 ]
 lint.per-file-ignores."benchmarks/*" = [ "D" ]
+lint.per-file-ignores."docs/*" = [ "I" ]
 lint.per-file-ignores."tests/*" = [ "D" ]
 lint.isort.known-first-party = [ "zarr_kvikio" ]
 lint.isort.required-imports = [ "from __future__ import annotations" ]
@@ -127,9 +172,29 @@ module = [
 ignore_missing_imports = true
 
 [tool.pytest]
-ini_options.testpaths = [ "tests" ]
-ini_options.addopts = [ "--import-mode=importlib", "--strict-markers", "-ra" ]
-ini_options.xfail_strict = true
+addopts = [
+  "--import-mode=importlib", # allow using test files with same name
+  "-ra",                     # list the skipped GPU tests
+]
+strict = true
+testpaths = [ "tests" ]
 
 [tool.coverage]
-run.source_pkgs = [ "zarr_kvikio" ]
+run.source = [ "zarr_kvikio" ]
+run.omit = [
+  "**/test_*.py",
+]
+run.patch = [ "subprocess" ]
+
+[tool.cruft]
+skip = [
+  ".git",
+  "tests",
+  "src/**/__init__.py",
+  "src/**/basic.py",
+  "docs/api.md",
+  "docs/changelog.md",
+  "docs/references.bib",
+  "docs/references.md",
+  "docs/notebooks/example.ipynb",
+]
