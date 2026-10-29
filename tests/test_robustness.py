@@ -19,10 +19,11 @@ import numpy as np
 import pytest
 import zarr
 from zarr.codecs import BloscCodec, ZstdCodec
-from zarr.core.buffer import gpu
+from zarr.core.buffer import cpu, gpu
 
 import zarr_kvikio
 from zarr_kvikio import _pipeline
+from zarr_kvikio._config import GPU_BUFFERS, INSTALL_HINT, PIPELINE_PATH
 
 try:
     import cupy as cp
@@ -173,7 +174,7 @@ class FakeStream:
 def test_decode_errors_return_the_codec(monkeypatch, nvcomp, fault):
     """Else every later decode on the device (and `release_memory`) waits for it forever."""
     nvcomp.as_arrays = list
-    monkeypatch.setenv("ZARR_KVIKIO_MAX_DECODE_BYTES", "1")  # one decode call per frame
+    zarr.config.set({"kvikio.max_decode_bytes": 1})  # one decode call per frame
     log = []
 
     def decode(src, out):
@@ -267,7 +268,7 @@ def test_serial_host_reads_overlap_the_copies(tmp_path, monkeypatch):
     After an error, the reads of slabs not started yet are dropped.
     """
     slab = 64
-    monkeypatch.setenv("ZARR_KVIKIO_READ_THREADS", "1")
+    zarr.config.set({"kvikio.read_threads": 1})
     monkeypatch.setattr(_pipeline, "_STAGING_STEP_BYTES", 2 * slab)
     monkeypatch.setattr(_pipeline, "_STAGING_LIMIT_BYTES", 2 * slab)  # (a half for each slab)
     monkeypatch.setattr(_pipeline, "_READ_PART_BYTES", slab // 2)
@@ -347,8 +348,8 @@ def test_read_threads_setting_replaces_the_executor(tmp_path, monkeypatch):
     executors = []
     fd = os.open(path, os.O_RDONLY)
     try:
-        for threads in ("2", "3"):
-            monkeypatch.setenv("ZARR_KVIKIO_READ_THREADS", threads)
+        for threads in (2, 3):
+            zarr.config.set({"kvikio.read_threads": threads})
             reads = [(fd, 0, 50, 0), (fd, 50, 50, 50)]
             _pipeline._fetch_host_reads(reads, np.zeros(100, np.uint8))()
             executors.append(_pipeline._executor)
@@ -361,14 +362,36 @@ def test_read_threads_setting_replaces_the_executor(tmp_path, monkeypatch):
         old.submit(int)
 
 
+@pytest.mark.parametrize(("value", "shown"), [("1MiB", "'1MiB'"), (1e6, "1000000.0"), (0, "0")])
+def test_bad_integer_settings_name_the_variable(value, shown):
+    zarr.config.set({"kvikio.setting": value})
+    match = f"'kvikio.setting' (ZARR_KVIKIO__SETTING) must be an integer of at least 1, got {shown}"
+    with pytest.raises(ValueError, match=re.escape(match)):
+        _pipeline._int_setting("kvikio.setting", 1, 1)
+
+
 @pytest.mark.parametrize(
-    ("value", "minimum", "match"),
-    [("1MiB", None, "must be an integer, got '1MiB'"), ("0", 1, "must be at least 1, got 0")],
+    ("env", "setting", "expected"),
+    [
+        (None, {}, 8),
+        ("4", {}, 4),
+        ("4", {"kvikio.num_threads": 2}, 2),
+        (None, {"kvikio.num_threads": None}, 3),
+    ],
 )
-def test_bad_integer_settings_name_the_variable(monkeypatch, value, minimum, match):
-    monkeypatch.setenv("ZARR_KVIKIO_SETTING", value)
-    with pytest.raises(ValueError, match=f"ZARR_KVIKIO_SETTING {match}"):
-        _pipeline._env_int("ZARR_KVIKIO_SETTING", 1, minimum)
+def test_kvikio_thread_count(monkeypatch, env, setting, expected):
+    """KvikIO's thread count follows zarr's config before reads with KvikIO (default: 8)."""
+    threads = {"num_threads": 3}  # (set some other way)
+    defaults = SimpleNamespace(get=threads.__getitem__, set=threads.update)
+    monkeypatch.setitem(sys.modules, "kvikio", SimpleNamespace(defaults=defaults))
+    monkeypatch.setitem(sys.modules, "kvikio.defaults", defaults)
+    if env is None:
+        monkeypatch.delenv("KVIKIO_NTHREADS", raising=False)
+    else:
+        monkeypatch.setenv("KVIKIO_NTHREADS", env)
+    zarr.config.set(setting)
+    _pipeline._kvikio()
+    assert threads["num_threads"] == expected
 
 
 # ---------------------------------------------------------------------------------------------
@@ -377,17 +400,34 @@ def test_bad_integer_settings_name_the_variable(monkeypatch, value, minimum, mat
 
 
 @needs_gpu
+def test_gpu_reads_need_kvikio_and_nvcomp(tmp_path, monkeypatch):
+    """With the pipeline selected in zarr's config alone: also the reads decoded on the CPU."""
+    write(tmp_path / "a.zarr", rng.random(1000).astype("float32"), (100,), shards=(500,))
+    monkeypatch.setattr(zarr_kvikio._config, "available", lambda: False)
+    _pipeline._require_once.cache_clear()
+    try:
+        with zarr.config.set({"codec_pipeline.path": PIPELINE_PATH, **GPU_BUFFERS}):
+            arr = zarr.open_array(tmp_path / "a.zarr", mode="r")
+            with pytest.raises(ImportError, match=re.escape(INSTALL_HINT)):
+                arr[:]
+            # (reads into host memory don't need them)
+            assert arr.get_basic_selection(prototype=cpu.buffer_prototype).shape == (1000,)
+    finally:
+        _pipeline._require_once.cache_clear()
+
+
+@needs_gpu
 @pytest.mark.parametrize(
     ("name", "value"),
-    [("ZARR_KVIKIO_DECODERS", "0"), ("ZARR_KVIKIO_MIN_BYTES", "1e6"), ("ZARR_KVIKIO_FETCH", "gds")],
+    [("kvikio.decoders", 0), ("kvikio.min_bytes", 1e6), ("kvikio.fetch", "gds")],
 )
-def test_bad_settings_raise(tmp_path, monkeypatch, name, value):
+def test_bad_settings_raise(tmp_path, name, value):
     """Instead of e.g. waiting forever for one of no codecs."""
     zarr_kvikio.release_memory()  # (the codecs are made with the settings)
     write(tmp_path / "a.zarr", rng.random(1000).astype("float32"), (100,), shards=(500,))
-    monkeypatch.setenv("ZARR_KVIKIO_MIN_BYTES", "0")
-    monkeypatch.setenv(name, value)
-    with pytest.raises(ValueError, match=f"{name} must be"):
+    zarr.config.set({"kvikio.min_bytes": 0})
+    zarr.config.set({name: value})
+    with pytest.raises(ValueError, match=f"'{name}' .* must be"):
         read_gpu(tmp_path / "a.zarr")
 
 
@@ -397,9 +437,9 @@ def test_bad_settings_raise(tmp_path, monkeypatch, name, value):
     [(None, False), ((1 << 15,), False), ((1 << 15,), True)],
     ids=["unsharded", "sharded", "sharded-unwritten-chunk"],
 )
-def test_reads_wait_for_the_default_stream(tmp_path, monkeypatch, shards, unwritten):
+def test_reads_wait_for_the_default_stream(tmp_path, shards, unwritten):
     """zarr allocates the output on the default stream, where queued work may still use it."""
-    monkeypatch.setenv("ZARR_KVIKIO_MIN_BYTES", "0")
+    zarr.config.set({"kvikio.min_bytes": 0})
     data = rng.random(1 << 16).astype("float32")
     if unwritten:  # (`_read_gpu` fills it in `out` before reading anything)
         data[: 1 << 13] = 0
@@ -425,8 +465,7 @@ def test_open_files_are_bounded(tmp_path, monkeypatch, fetch, shards):
 
     budget = 6
     monkeypatch.setattr(_pipeline, "_open_files", _pipeline._FileBudget(budget))
-    monkeypatch.setenv("ZARR_KVIKIO_MIN_BYTES", "0")
-    monkeypatch.setenv("ZARR_KVIKIO_FETCH", fetch)
+    zarr.config.set({"kvikio.min_bytes": 0, "kvikio.fetch": fetch})
     lock, fds, opened = threading.Lock(), set(), [0, 0]  # (open now, at most)
 
     def count(n):
@@ -480,8 +519,7 @@ def test_open_files_are_bounded(tmp_path, monkeypatch, fetch, shards):
 @pytest.mark.parametrize("fetch", ["host", "kvikio"])
 def test_contiguous_reads_close_files_before_decoding(tmp_path, monkeypatch, fetch):
     """The shard files (and their file descriptor budget) are needed only until they are read."""
-    monkeypatch.setenv("ZARR_KVIKIO_MIN_BYTES", "0")
-    monkeypatch.setenv("ZARR_KVIKIO_FETCH", fetch)
+    zarr.config.set({"kvikio.min_bytes": 0, "kvikio.fetch": fetch})
     monkeypatch.setattr(_pipeline, "_open_files", budget := _pipeline._FileBudget(64))
     decode, held = _pipeline._decode_into, []
 
@@ -508,8 +546,7 @@ def test_kvikio_read_faults(tmp_path, monkeypatch, fault, shards):
     """A read failing or returning fewer bytes raises, once every other read is done."""
     import kvikio
 
-    monkeypatch.setenv("ZARR_KVIKIO_MIN_BYTES", "0")
-    monkeypatch.setenv("ZARR_KVIKIO_FETCH", "kvikio")
+    zarr.config.set({"kvikio.min_bytes": 0, "kvikio.fetch": "kvikio"})
     events, reads = [], []
 
     class Future:
@@ -664,7 +701,7 @@ if {fault}:
     except cp.cuda.runtime.CUDARuntimeError:
         pass
 """
-    env = {**os.environ, "ZARR_KVIKIO_MIN_BYTES": "0"}
+    env = {**os.environ, "ZARR_KVIKIO__MIN_BYTES": "0"}
     proc = subprocess.run(
         [sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=300
     )

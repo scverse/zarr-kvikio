@@ -27,7 +27,7 @@ def check() -> dict[str, Any]:
     if :func:`available`; on with ``KVIKIO_COMPAT_MODE=ON`` or without a usable cuFile). Without
     GPUDirect Storage, KvikIO reads through the page cache and a bounce buffer, which still works
     (and is fast for cached data), but isn't direct NVMe to GPU DMA. Contiguous reads of
-    zstd-compressed sharded 1-D arrays only use KvikIO with ``ZARR_KVIKIO_FETCH=kvikio``.
+    zstd-compressed sharded 1-D arrays only use KvikIO with ``kvikio.fetch`` set to ``"kvikio"``.
     """
     gds = _gds_status()
     if available():

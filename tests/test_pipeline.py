@@ -18,7 +18,7 @@ from zarr.codecs import (
     ShardingCodec,
     ZstdCodec,
 )
-from zarr.core.buffer import gpu
+from zarr.core.buffer import cpu, gpu
 from zarr.core.codec_pipeline import FusedCodecPipeline
 
 import zarr_kvikio
@@ -45,10 +45,10 @@ def gpu_pipeline() -> Generator[None]:
 
 
 @pytest.fixture(autouse=True, params=["gpu", "host"])
-def read_path(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+def read_path(request: pytest.FixtureRequest) -> str:
     """Run every test through both read paths: KvikIO + nvCOMP, and host reads + CPU decoding
-    (which is used for reads smaller than `ZARR_KVIKIO_MIN_BYTES`)."""
-    monkeypatch.setenv("ZARR_KVIKIO_MIN_BYTES", "0" if request.param == "gpu" else str(1 << 40))
+    (which is used for reads smaller than `kvikio.min_bytes`)."""
+    zarr.config.set({"kvikio.min_bytes": 0 if request.param == "gpu" else 1 << 40})
     return request.param
 
 
@@ -269,11 +269,17 @@ def test_host_buffers_fall_back(tmp_path, fast_path_calls, fused_reads):
     assert fused_reads
 
 
-HOST_PIPELINES = [  # (the pipeline zarr was configured with before `enable()`)
+HOST_PIPELINES = [  # (set, or the pipeline zarr was configured with before `enable()`)
     pytest.param({}, id="default"),
+    pytest.param({"kvikio.host_pipeline": PIPELINE}, id="own"),  # (zarr's fused one)
     pytest.param(
         {"codec_pipeline.path": "zarrs.ZarrsCodecPipeline"},
         id="zarrs",
+        marks=pytest.mark.skipif(find_spec("zarrs") is None, reason="needs zarrs"),
+    ),
+    pytest.param(
+        {"kvikio.host_pipeline": "zarrs.ZarrsCodecPipeline"},
+        id="zarrs-set",
         marks=pytest.mark.skipif(find_spec("zarrs") is None, reason="needs zarrs"),
     ),
 ]
@@ -331,8 +337,14 @@ def test_pickle_keeps_pipeline(tmp_path):
     data = rng.random(300).astype("float32")
     write(tmp_path / "a.zarr", data, (50,), shards=(150,))
     with gpu_pipeline():
-        arr = pickle.loads(pickle.dumps(zarr.open_array(tmp_path / "a.zarr", mode="r")))
-        assert type(arr._async_array.codec_pipeline).__name__ == "KvikioCodecPipeline"
+        arr = zarr.open_array(tmp_path / "a.zarr", mode="r")
+        arr.get_basic_selection(slice(1), prototype=cpu.buffer_prototype)  # (on the host)
+        assert "_host" in arr._async_array.codec_pipeline.__dict__
+        arr = pickle.loads(pickle.dumps(arr))
+        pipeline = arr._async_array.codec_pipeline
+        assert type(pipeline).__name__ == "KvikioCodecPipeline"
+        # (made again from the zarr config of the process that unpickles it, e.g. a Dask worker)
+        assert "_host" not in pipeline.__dict__
         np.testing.assert_array_equal(cp.asnumpy(arr[:]), data)
 
 
@@ -340,7 +352,7 @@ def test_pickle_keeps_pipeline(tmp_path):
 def test_decode_in_several_calls(tmp_path, monkeypatch, fast_path_calls, read_path, shards):
     import nvidia.nvcomp as nv
 
-    monkeypatch.setenv("ZARR_KVIKIO_MAX_DECODE_BYTES", "300")  # < 2 chunks of 40 float32 per call
+    zarr.config.set({"kvikio.max_decode_bytes": 300})  # < 2 chunks of 40 float32 per call
     as_arrays, frames = nv.as_arrays, []  # (frames per call, and as many outputs)
     monkeypatch.setattr(nv, "as_arrays", lambda a: frames.append(len(a)) or as_arrays(a))
     data = rng.random(1000).astype("float32")
@@ -379,7 +391,7 @@ def test_enable(tmp_path, fast_path_calls):
     ) == before
 
 
-def test_dask_enable(tmp_path):
+def test_dask_enable(tmp_path, read_path):
     distributed = pytest.importorskip("distributed")
     da = pytest.importorskip("dask.array")
     import zarr_kvikio.dask
@@ -391,7 +403,8 @@ def test_dask_enable(tmp_path):
             n_workers=1, threads_per_worker=2, processes=True, dashboard_address=":0"
         ) as cluster,
         distributed.Client(cluster) as client,
-        zarr_kvikio.dask.enable(client, num_threads=2),
+        zarr.config.set({"kvikio.num_threads": 2, "kvikio.fetch": "kvikio"}),  # (uses KvikIO)
+        zarr_kvikio.dask.enable(client),
     ):
         # arrays opened here are read on the workers, into GPU memory
         x = da.from_zarr(zarr.open_array(tmp_path / "a.zarr", mode="r"), chunks=250)
@@ -403,11 +416,14 @@ def test_dask_enable(tmp_path):
         assert isinstance(zarr.open_array(tmp_path / "a.zarr", mode="r")[:], np.ndarray)
         workers = client.run(lambda: zarr.config.get("codec_pipeline.path"))
         assert set(workers.values()) == {PIPELINE}
+        if read_path == "gpu":  # this process's settings, used on the workers
+            threads = client.run(lambda: __import__("kvikio").defaults.get("num_threads"))
+            assert set(threads.values()) == {2}
 
 
 @pytest.mark.parametrize("read_path", ["gpu"], indirect=True)  # (sets the threshold itself)
-def test_small_reads_decoded_on_host(tmp_path, monkeypatch, fast_path_calls):
-    monkeypatch.setenv("ZARR_KVIKIO_MIN_BYTES", str(1 << 20))
+def test_small_reads_decoded_on_host(tmp_path, fast_path_calls):
+    zarr.config.set({"kvikio.min_bytes": 1 << 20})
     data = rng.random(1 << 20).astype("float32")  # 4 MiB
     write(tmp_path / "a.zarr", data, (1 << 16,), shards=(1 << 18,))
     with warnings.catch_warnings():
@@ -421,11 +437,11 @@ def test_small_reads_decoded_on_host(tmp_path, monkeypatch, fast_path_calls):
     assert fast_path_calls == ["_read_gpu_contiguous"]
 
 
-@pytest.mark.parametrize("decoders", ["1", "3"])
-def test_concurrent_reads(tmp_path, monkeypatch, decoders):
+@pytest.mark.parametrize("decoders", [1, 3])
+def test_concurrent_reads(tmp_path, decoders):
     from concurrent.futures import ThreadPoolExecutor
 
-    monkeypatch.setenv("ZARR_KVIKIO_DECODERS", decoders)
+    zarr.config.set({"kvikio.decoders": decoders})
     zarr_kvikio.release_memory()
     data = rng.random(200_000).astype("float32")
     write(tmp_path / "a.zarr", data, (4096,), shards=(4096 * 8,))
@@ -445,9 +461,9 @@ def test_concurrent_reads(tmp_path, monkeypatch, decoders):
     [slice(None), slice(37, 4900), slice(1000, 1001), slice(512, 1536)],
     ids=["all", "partial-chunks-several-shards", "one-value", "whole-chunks"],
 )
-def test_contiguous_reads(tmp_path, monkeypatch, fast_path_calls, read_path, *, fetch, selection):
+def test_contiguous_reads(tmp_path, fast_path_calls, read_path, *, fetch, selection):
     """Contiguous ranges of sharded 1-D arrays, like a sparse matrix's data and indices."""
-    monkeypatch.setenv("ZARR_KVIKIO_FETCH", fetch)
+    zarr.config.set({"kvikio.fetch": fetch})
     data = rng.random(5000).astype("float32")
     write(tmp_path / "a.zarr", data, (256,), shards=(1024,))
     check(tmp_path / "a.zarr", selection)
@@ -502,10 +518,10 @@ def test_contiguous_reads_in_parallel(tmp_path, monkeypatch, fast_path_calls, re
         assert "zarr-kvikio-read" in used
 
 
-def test_release_memory_staging(tmp_path, monkeypatch, read_path):
+def test_release_memory_staging(tmp_path, read_path):
     if read_path == "host":
         pytest.skip("host reads use no pinned staging buffers")
-    monkeypatch.setenv("ZARR_KVIKIO_FETCH", "host")
+    zarr.config.set({"kvikio.fetch": "host"})
     data = rng.random(1 << 15).astype("float32")
     write(tmp_path / "a.zarr", data, (512,), shards=(1 << 13,))
     check(tmp_path / "a.zarr", slice(None))

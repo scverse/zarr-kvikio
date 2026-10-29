@@ -9,11 +9,13 @@ All notable changes to this project are documented here. The format follows
 ### Added
 
 - `KvikioCodecPipeline`: reads zstd-compressed or uncompressed (optionally sharded) zarr v3 arrays from local
-  files into GPU memory with KvikIO and decodes them with nvCOMP; everything else is handled by the previously
-  configured pipeline (e.g. zarrs) or zarr's own pipelines. Contiguous ranges of sharded 1-D arrays are read
-  in batches.
-- `enable()` and `zarr_kvikio.dask.enable()` (undoable, also on Dask workers; `dask.enable()` calls can be undone
-  in any order, and only the workers need KvikIO and nvCOMP), `available()`, `require()`.
+  files into GPU memory with KvikIO and decodes them with nvCOMP; everything else is handled by
+  `kvikio.host_pipeline` (e.g. zarrs) or zarr's own pipelines. Contiguous ranges of sharded 1-D arrays are read
+  in batches. Like zarrs, it is selected and set up through zarr's config alone: `codec_pipeline.path`, and
+  `kvikio.*` settings (also as `ZARR_KVIKIO__*` environment variables).
+- `enable()`, to select it with GPU buffers, and `zarr_kvikio.dask.enable()` (undoable, also on Dask workers, which
+  get the `kvikio.*` settings; `dask.enable()` calls can be undone in any order, and only the workers need KvikIO
+  and nvCOMP), `available()`, `require()`.
 - `check()` and `describe()` to diagnose the installation and an array's layout.
 - `convert_array()`, `layout()` and `cpu_pipeline()` to rewrite arrays in the layout the GPU reads fastest.
 - `release_memory()` to free nvCOMP's scratch space and the pinned host read buffers.

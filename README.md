@@ -23,15 +23,28 @@ pip install "zarr-kvikio[cuda13]"  # or [cuda12]; add ,dask for zarr_kvikio.dask
 Without the `cuda12`/`cuda13` extra, zarr-kvikio installs without the GPU stack (KvikIO, nvCOMP, CuPy):
 it can then check and convert stores, and `zarr_kvikio.enable()` explains what is missing.
 
-## Quick start
+## Usage
+
+Like [zarrs](https://github.com/zarrs/zarrs-python), zarr-kvikio is used through zarr's config: once it's installed,
+zarr finds the pipeline by name, so any package can switch to it without importing zarr-kvikio:
 
 ```python
 import zarr
+
+# (arrays get the pipeline when they are opened)
+zarr.config.set({"codec_pipeline.path": "zarr_kvikio.KvikioCodecPipeline"})
+zarr.config.enable_gpu()  # zarr's GPU buffers: reads return CuPy arrays
+x = zarr.open_array("data.zarr", mode="r")[:]  # cupy.ndarray, read and decoded on the GPU
+```
+
+Reads into host buffers (without `enable_gpu()`) still work, on the CPU, so the pipeline can stay selected in code that
+also reads into host memory. `zarr_kvikio.enable()` sets both, after checking that KvikIO and nvCOMP are installed:
+
+```python
 import zarr_kvikio
 
-zarr_kvikio.enable()  # or only within a block: with zarr_kvikio.enable(): ...
-arr = zarr.open_array("data.zarr", mode="r")  # the pipeline is bound when the array is opened
-x = arr[:]  # cupy.ndarray
+with zarr_kvikio.enable():  # or without `with`, to leave it on
+    x = zarr.open_array("data.zarr", mode="r")[:]
 ```
 
 With Dask, one call switches the whole cluster: the workers read into GPU memory,
@@ -46,17 +59,23 @@ zarr_kvikio.dask.enable(client)
 X = anndata.experimental.read_elem_lazy(zarr.open_group("data.zarr")["X"])
 ```
 
-Only the workers need KvikIO and nvCOMP: if one lacks them, `dask.enable()` raises and undoes itself.
-In-process workers (`Client(processes=False)`, `LocalCluster(processes=False)`) share zarr's and KvikIO's settings
-with the client, which then reads into GPU memory too, until the call is undone (also after the cluster closes).
-Repeated `dask.enable()` calls can be undone in any order.
+Only the workers need KvikIO and nvCOMP: if one lacks them, `dask.enable()` raises and undoes itself. The workers get
+this process's `kvikio.*` settings (see [Configuration](#configuration)) as they are when it is called. In-process
+workers (`Client(processes=False)`, `LocalCluster(processes=False)`) share zarr's settings with the client, which then
+reads into GPU memory too, until the call is undone (also after the cluster closes). Repeated `dask.enable()` calls can
+be undone in any order.
+Workers started some other way (e.g. `dask cuda worker`) can be set up through the environment zarr is imported in
+instead, while the client selects the pipeline in its config:
+`ZARR_CODEC_PIPELINE__PATH=zarr_kvikio.KvikioCodecPipeline` (for arrays opened on the workers, e.g. a sparse matrix's
+indices), `ZARR_BUFFER=zarr.buffer.gpu.Buffer`, `ZARR_NDBUFFER=zarr.buffer.gpu.NDBuffer`, and any `ZARR_KVIKIO__*`
+settings.
 
 ## API
 
 | | |
 |---|---|
-| `enable(num_threads=8)` | Read zarr arrays into GPU memory in this process (also as a context manager). |
-| `dask.enable(client, num_threads=8)` | The same on every worker of a Dask cluster, including workers started later. |
+| `enable()` | Select the pipeline and GPU buffers in zarr's config, in this process (also as a context manager). |
+| `dask.enable(client)` | The same on every worker of a Dask cluster, including workers started later. |
 | `available()`, `require()` | Whether KvikIO and nvCOMP are installed; raise with install instructions if not. |
 | `check()` | KvikIO, nvCOMP, zarr and CuPy versions, and whether GPUDirect Storage is active (from `gdscheck` and KvikIO's compatibility mode). |
 | `describe(array)` | An array's layout and what keeps it from being read fast on the GPU (including a store other than `LocalStore`). |
@@ -66,52 +85,65 @@ Repeated `dask.enable()` calls can be undone in any order.
 | `release_memory()` | Free the GPU scratch space held by the cached nvCOMP codecs and the pinned host read buffers. |
 | `KvikioCodecPipeline` | The codec pipeline, registered with zarr as `"zarr_kvikio.KvikioCodecPipeline"`. |
 
-## Settings
+## Configuration
 
-The `ZARR_KVIKIO_*` environment variables below take integers, except `ZARR_KVIKIO_FETCH` (`host` or `kvikio`);
-other values raise a `ValueError` naming the variable. They are read by every read that uses them, so a change applies
-to the next read, except for `ZARR_KVIKIO_DECODERS`.
+Like zarrs' options, zarr-kvikio's are keys of zarr's config, in its `kvikio` section:
 
-- **`num_threads`** of `enable()` / `dask.enable()` (default 8): KvikIO itself reads with a single thread by default.
-  `None` leaves KvikIO's thread count unchanged; undoing `enable()` (e.g. at the end of a `with` block, also on
-  Dask workers) restores the previous count.
-- **`ZARR_KVIKIO_MAX_DECODE_BYTES`** (default 1 GiB): the most decoded bytes per nvCOMP call.
+```python
+zarr.config.set({"kvikio.host_pipeline": "zarrs.ZarrsCodecPipeline", "kvikio.num_threads": 16})
+```
+
+or environment variables, which zarr reads when it is imported (e.g. `ZARR_KVIKIO__NUM_THREADS=16`). Each read uses
+the settings of the process it runs in as they are then, except for `kvikio.decoders` and `kvikio.host_pipeline`
+(see below). Invalid values raise a `ValueError` naming the key.
+
+- **`kvikio.host_pipeline`** (default: zarr's `FusedCodecPipeline`): the codec pipeline for reads into host buffers,
+  writes of host buffers, and decoding what the GPU can't on the CPU, e.g. `"zarrs.ZarrsCodecPipeline"` (with zarrs'
+  own options). If it isn't set, `enable()` and `dask.enable()` set it to the pipeline zarr was configured with
+  (e.g. zarrs).
+  An opened array reads it when it first needs that pipeline, and keeps it (copies sent to Dask workers read it there).
+- **`kvikio.num_threads`** (default 8, or `KVIKIO_NTHREADS` if that is set): the threads KvikIO reads with, a setting
+  of the whole process that KvikIO sets to 1 by default. Before each read with KvikIO, KvikIO's thread count is set to
+  this if it differs (also if it was set with `kvikio.defaults.set`); `None` leaves it alone.
+- **`kvikio.max_decode_bytes`** (default 1 GiB): the most decoded bytes per nvCOMP call.
   nvCOMP's batched zstd decode needs about **3.2× the decoded size as scratch space**,
   and its codec keeps that memory for reuse, so this bounds the device memory held (≈3.4 GB by default).
   Each call also costs a few milliseconds, so a larger limit speeds up very large reads.
-- **`ZARR_KVIKIO_MIN_BYTES`** (default 1 MiB): smaller reads are read and zstd-decoded on the CPU by zarr-kvikio itself
+- **`kvikio.min_bytes`** (default 1 MiB): smaller reads are read and zstd-decoded on the CPU by zarr-kvikio itself
   and copied to the GPU at once.
   Every nvCOMP call has a fixed cost of a few milliseconds, more than decoding e.g. a small slice of a sparse matrix's `indptr`.
-- **`ZARR_KVIKIO_DECODERS`** (default 1, at least 1): nvCOMP codecs per GPU, each with its own scratch space.
+- **`kvikio.decoders`** (default 1): nvCOMP codecs per GPU, each with its own scratch space.
   More let several threads decode at once; for sparse-matrix reads from 10 threads per GPU, 2-4 were not faster.
   `zarr_kvikio.release_memory()` frees that scratch space. The setting is read when a GPU's codecs are created: at its
   first decode, and at the first one after `release_memory()`.
-- **`ZARR_KVIKIO_FETCH`** (default `host`): how contiguous reads of zstd-compressed sharded 1-D arrays (e.g. a sparse
-  matrix's `data` and `indices`) fetch the stored bytes. `host` reads them into pinned host memory and copies them to
+- **`kvikio.fetch`** (default `"host"`): how contiguous reads of zstd-compressed sharded 1-D arrays (e.g. a sparse
+  matrix's `data` and `indices`) fetch the stored bytes. `"host"` reads them into pinned host memory and copies them to
   the GPU at once, which is fastest when the data comes from the page cache or GPUDirect Storage runs in compatibility
-  mode; `kvikio` reads them straight into GPU memory with KvikIO (for GPUDirect Storage).
-  `host` keeps its pinned buffers for later reads, shared by all threads: up to 4 GiB in all, but at least 64 MiB for
+  mode; `"kvikio"` reads them straight into GPU memory with KvikIO (for GPUDirect Storage).
+  `"host"` keeps its pinned buffers for later reads, shared by all threads: up to 4 GiB in all, but at least 64 MiB for
   each read running at once. A buffer grows for a larger read (freeing the other kept ones if no other read runs, it
   holds less than half the read, and that lets it grow; one that holds half only grows to fit), which pins new memory
   once; a read with more stored bytes than its buffer streams through it in parts, which can be slower.
   `zarr_kvikio.release_memory()` frees these buffers.
-- **`ZARR_KVIKIO_READ_THREADS`** (default 16): threads for those host reads.
-- The files that reads keep open while they fetch the stored bytes use at most half the soft limit of open files
-  (`ulimit -n`, read at the first read), all threads together, and one read opens at most 256 of them at once; reads
-  wait for free file descriptors (first come, first served) instead of failing. Files opened only briefly, e.g. to read
-  shard indices or for reads decoded on the CPU, are not counted.
-- If KvikIO isn't using GPUDirect Storage (`zarr_kvikio.check()`, or `gdscheck -p`), it reads through the page cache and
-  a bounce buffer. That still works (and is fast for cached data), but isn't direct NVMe to GPU DMA. With the default
-  `ZARR_KVIKIO_FETCH=host`, contiguous reads of zstd-compressed sharded 1-D arrays go through pinned host memory
-  instead of KvikIO, so GPUDirect Storage applies to them only with `ZARR_KVIKIO_FETCH=kvikio`.
+- **`kvikio.read_threads`** (default 16): threads for those host reads.
+
+The files that reads keep open while they fetch the stored bytes use at most half the soft limit of open files
+(`ulimit -n`, read at the first read), all threads together, and one read opens at most 256 of them at once; reads
+wait for free file descriptors (first come, first served) instead of failing. Files opened only briefly, e.g. to read
+shard indices or for reads decoded on the CPU, are not counted.
+
+If KvikIO isn't using GPUDirect Storage (`zarr_kvikio.check()`, or `gdscheck -p`), it reads through the page cache and
+a bounce buffer. That still works (and is fast for cached data), but isn't direct NVMe to GPU DMA. With the default
+`kvikio.fetch`, contiguous reads of zstd-compressed sharded 1-D arrays go through pinned host memory instead of KvikIO,
+so GPUDirect Storage applies to them only with `"kvikio"`.
 
 ## What takes the fast path
 
 A read takes the fast path, which reads the stored bytes with KvikIO (or into pinned host memory, see
-`ZARR_KVIKIO_FETCH`) and decodes them on the GPU with nvCOMP (uncompressed ones are copied), when all of these hold:
+`kvikio.fetch`) and decodes them on the GPU with nvCOMP (uncompressed ones are copied), when all of these hold:
 
-- the output is a GPU buffer of the array's data type (`zarr_kvikio.enable()`, or `zarr.config.enable_gpu()` with the
-  pipeline selected) of at least `ZARR_KVIKIO_MIN_BYTES` (smaller reads are decoded on the CPU by zarr-kvikio and then
+- the output is a GPU buffer of the array's data type (`zarr.config.enable_gpu()` with the pipeline selected, or
+  `zarr_kvikio.enable()`) of at least `kvikio.min_bytes` (smaller reads are decoded on the CPU by zarr-kvikio and then
   copied),
 - the array lives in a `zarr.storage.LocalStore`,
 - the array is zarr v3 with a fixed-size numeric dtype, and
@@ -119,19 +151,19 @@ A read takes the fast path, which reads the stored bytes with KvikIO (or into pi
   either directly or as the inner codecs of the `sharding_indexed` codec
   (index codecs `bytes` + optional `crc32c`, index at the start or end).
 
-Everything else, including reads into host buffers and writes of host buffers, is handled by the pipeline zarr was
-configured with before `enable()` (e.g. zarrs), or else zarr's `FusedCodecPipeline`. Reads into GPU buffers of arrays
-the GPU can't decode (e.g. blosc), or into GPU buffers of another data type than the array's, are decoded on the CPU and
-then copied. Writes of GPU buffers (every write while `enable()` is active), and reads of other data types (e.g.
-strings) into GPU buffers, go through zarr's `BatchedCodecPipeline`.
+Everything else, including reads into host buffers and writes of host buffers, is handled by `kvikio.host_pipeline`
+(e.g. zarrs), or else zarr's `FusedCodecPipeline`. Reads into GPU buffers of arrays the GPU can't decode (e.g. blosc),
+or into GPU buffers of another data type than the array's, are decoded on the CPU and then copied. Writes of GPU
+buffers (every write while `enable()` is active), and reads of other data types (e.g. strings) into GPU buffers, go
+through zarr's `BatchedCodecPipeline`.
 
 How a fast read works:
 
 1. The shard indices are read on the host (a few bytes per inner chunk; the `crc32c` is verified).
-2. The stored bytes of every needed chunk are read with KvikIO (or into pinned host memory, see `ZARR_KVIKIO_FETCH`),
+2. The stored bytes of every needed chunk are read with KvikIO (or into pinned host memory, see `kvikio.fetch`),
    one read per contiguous byte range (so typically one read per shard).
 3. The chunks of the request are decoded (if compressed) in batched nvCOMP calls of up to
-   `ZARR_KVIKIO_MAX_DECODE_BYTES` each (usually one call).
+   `kvikio.max_decode_bytes` each (usually one call).
 4. The decoded values are copied into the output buffer.
    For 1-D arrays, chunks that are selected as a whole are decoded directly into the output.
 

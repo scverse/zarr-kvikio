@@ -1,4 +1,4 @@
-"""How `zarr_kvikio.dask.enable` changes and restores the config, without reading on the GPU."""
+"""How `zarr_kvikio.enable` and `.dask.enable` change and restore the config, without reading."""
 
 from __future__ import annotations
 
@@ -12,8 +12,7 @@ import zarr
 
 import zarr_kvikio
 import zarr_kvikio.dask
-from zarr_kvikio._config import INSTALL_HINT
-from zarr_kvikio._pipeline import HOST_PIPELINE_KEY
+from zarr_kvikio._config import HOST_PIPELINE_KEY, INSTALL_HINT
 
 PIPELINE = "zarr_kvikio.KvikioCodecPipeline"
 CLUSTERS = [
@@ -50,7 +49,7 @@ def client(request, monkeypatch, state):
         ) as cluster,
         distributed.Client(cluster) as client,
     ):
-        # the workers check for KvikIO and nvCOMP, which they don't need with num_threads=None
+        # the workers check for KvikIO and nvCOMP, which these tests don't need (nothing is read)
         # (in-process workers share this process's modules)
         monkeypatch.setattr(zarr_kvikio._config, "available", lambda: True)
         if processes:
@@ -65,7 +64,7 @@ def test_enable_nested(client, state):
     before, on_workers = state(), set(client.run(state).values())
     # undone in any order, the calls not undone yet stay in effect, here and on the workers
     for order in chain(permutations(range(2)), permutations(range(3))):
-        calls = [zarr_kvikio.dask.enable(client, num_threads=None) for _ in order]
+        calls = [zarr_kvikio.dask.enable(client) for _ in order]
         enabled, enabled_on_workers = state(), set(client.run(state).values())
         assert enabled[0] == PIPELINE
         assert {(path, buf) for path, _, buf in enabled_on_workers} == {
@@ -86,12 +85,12 @@ def test_enable_undo_errors(client, state, monkeypatch):
         raise OSError(name)
 
     before = state()
-    with pytest.raises(KeyError), zarr_kvikio.dask.enable(client, num_threads=None):
+    with pytest.raises(KeyError), zarr_kvikio.dask.enable(client):
         raise KeyError
     assert state() == before
     assert plugins(client) == []
     # this process is restored even when the workers can't be reached
-    enabled = zarr_kvikio.dask.enable(client, num_threads=None)
+    enabled = zarr_kvikio.dask.enable(client)
     monkeypatch.setattr(client, "unregister_worker_plugin", unreachable)
     with pytest.raises(OSError, match=zarr_kvikio.dask.KvikioPlugin.name):
         enabled.__exit__(None, None, None)
@@ -110,7 +109,7 @@ def test_enable_setup_fails(client, state, monkeypatch):
     monkeypatch.setattr(zarr_kvikio.dask.KvikioPlugin, "setup", setup_fails_on_second_worker)
     before = state()
     with pytest.raises(RuntimeError, match="no GPU"):
-        zarr_kvikio.dask.enable(client, num_threads=None)
+        zarr_kvikio.dask.enable(client)
     # undone on the worker that was set up too, which shares this process's config
     assert set(client.run(state).values()) == {before}
     assert state() == before
@@ -128,12 +127,12 @@ def test_enable_interrupted(state):
     # a Ctrl-C doesn't wait for the workers to remove the plugin
     client = SimpleNamespace(register_plugin=interrupt, unregister_worker_plugin=removed.append)
     with pytest.raises(KeyboardInterrupt):
-        zarr_kvikio.dask.enable(client, num_threads=None)
+        zarr_kvikio.dask.enable(client)
     assert (state(), removed) == (before, [])
     # this process is left as it was, also after a Ctrl-C while removing the plugin
     client = SimpleNamespace(register_plugin=fail, unregister_worker_plugin=interrupt)
     with pytest.raises(KeyboardInterrupt):
-        zarr_kvikio.dask.enable(client, num_threads=None)
+        zarr_kvikio.dask.enable(client)
     assert state() == before
 
 
@@ -141,30 +140,44 @@ def test_enable_interrupted(state):
 def test_enable_needs_gpu_stack_on_workers(client, state, monkeypatch):
     # this process keeps reading into host memory
     monkeypatch.setattr(zarr_kvikio._config, "available", lambda: False)
-    with zarr_kvikio.dask.enable(client, num_threads=None):
+    with zarr_kvikio.dask.enable(client):
         pass
     # the workers need them
     client.run(setattr, zarr_kvikio._config, "available", lambda: False)
     before = state()
     with pytest.raises(ImportError, match=re.escape(INSTALL_HINT)):
-        zarr_kvikio.dask.enable(client, num_threads=None)
+        zarr_kvikio.dask.enable(client)
     assert state() == before
     assert plugins(client) == []
 
 
-@pytest.mark.skipif(not zarr_kvikio.available(), reason="needs KvikIO and nvCOMP")
 @pytest.mark.parametrize("client", CLUSTERS[-1:], indirect=True)
-def test_num_threads_restored(client):
-    import kvikio.defaults
+def test_enable_sends_settings(client):
+    """This process's `kvikio.*` settings, while the call is in effect."""
 
-    def num_threads() -> int:
-        return kvikio.defaults.get("num_threads")
+    def settings() -> tuple[object, ...]:
+        return tuple(zarr.config.get(k, None) for k in ("kvikio.num_threads", "kvikio.fetch"))
 
-    before = num_threads()
-    with zarr_kvikio.enable(num_threads=before + 3):
-        assert num_threads() == before + 3
-    assert num_threads() == before
-    on_workers = client.run(num_threads)
-    with zarr_kvikio.dask.enable(client, num_threads=max(on_workers.values()) + 3):
-        assert client.run(num_threads) != on_workers
-    assert client.run(num_threads) == on_workers
+    def own_setting() -> None:
+        zarr.config.set({"kvikio.fetch": "kvikio"})
+
+    client.run(own_setting)  # (kept)
+    with zarr.config.set({"kvikio.num_threads": 2}), zarr_kvikio.dask.enable(client):
+        assert set(client.run(settings).values()) == {(2, "kvikio")}
+    assert set(client.run(settings).values()) == {(None, "kvikio")}
+
+
+@pytest.mark.parametrize(
+    ("settings", "host"),
+    [
+        ({}, None),  # zarr's default (its fused pipeline is faster)
+        ({"codec_pipeline.path": "zarrs.ZarrsCodecPipeline"}, "zarrs.ZarrsCodecPipeline"),
+        ({"codec_pipeline.path": "zarrs.ZarrsCodecPipeline", HOST_PIPELINE_KEY: "x.Y"}, "x.Y"),
+    ],
+)
+def test_enable_keeps_the_host_pipeline(monkeypatch, settings, host):
+    monkeypatch.setattr(zarr_kvikio._config, "available", lambda: True)
+    with zarr.config.set(settings), zarr_kvikio.enable():
+        assert zarr.config.get(HOST_PIPELINE_KEY, None) == host
+        with zarr_kvikio.enable():  # (not ours)
+            assert zarr.config.get(HOST_PIPELINE_KEY, None) == host

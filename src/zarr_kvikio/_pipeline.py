@@ -6,17 +6,17 @@ Reads that can take the fast path
 2. read every needed chunk's compressed bytes straight into device memory with KvikIO,
    one read per contiguous byte range (i.e. typically one read per shard); contiguous ranges of
    zstd-compressed sharded 1-D arrays are read into pinned host memory and copied instead, by
-   default (``ZARR_KVIKIO_FETCH``),
+   default (``kvikio.fetch``),
 3. decode the chunks of the request in batched nvCOMP calls of at most
-   ``ZARR_KVIKIO_MAX_DECODE_BYTES`` decoded bytes each (usually a single call),
+   ``kvikio.max_decode_bytes`` decoded bytes each (usually a single call),
 4. copy the decoded values into the output buffer
    (fully selected chunks of 1-D arrays are decoded in place, without that copy).
 
-Reads of fewer than ``ZARR_KVIKIO_MIN_BYTES`` bytes are read and decoded on the CPU instead, and
-copied to the GPU at once.
+Reads of fewer than ``kvikio.min_bytes`` bytes are read and decoded on the CPU instead, and
+copied to the GPU at once. (The settings are keys of zarr's config.)
 
 Everything else works with any store: reads into host buffers and writes of host buffers are
-delegated to a host pipeline (the one zarr was configured with before, e.g. zarrs, else zarr's
+delegated to a host pipeline (``kvikio.host_pipeline``, e.g. zarrs, else zarr's
 :class:`~zarr.core.codec_pipeline.FusedCodecPipeline`), and reads into GPU buffers the GPU can't
 decode (e.g. blosc-compressed or remote chunks) are decoded by it on the host and then copied.
 Writes of GPU buffers, and reads of other data types (e.g. strings) into them, use zarr's
@@ -35,7 +35,7 @@ import threading
 from collections import deque
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
-from functools import cached_property
+from functools import cache, cached_property
 from itertools import batched, chain, groupby, product
 from math import prod
 from pathlib import Path
@@ -44,7 +44,7 @@ from typing import TYPE_CHECKING, Any, cast
 import google_crc32c
 import numpy as np
 import zarr
-from zarr.abc.codec import GetResult
+from zarr.abc.codec import CodecPipeline, GetResult
 from zarr.codecs import BytesCodec, Crc32cCodec, ShardingCodec, ZstdCodec
 from zarr.core.array_spec import ArraySpec
 from zarr.core.buffer import core, cpu
@@ -52,10 +52,12 @@ from zarr.core.chunk_utils import fill_value_or_default
 from zarr.core.codec_pipeline import BatchedCodecPipeline, FusedCodecPipeline
 from zarr.storage import LocalStore, StorePath
 
+from ._config import HOST_PIPELINE_KEY, ZARR_DEFAULT_PIPELINE, require
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator, Sequence
 
-    from zarr.abc.codec import ArrayArrayCodec, ArrayBytesCodec, BytesBytesCodec, CodecPipeline
+    from zarr.abc.codec import ArrayArrayCodec, ArrayBytesCodec, BytesBytesCodec
     from zarr.abc.store import ByteGetter, ByteSetter, Store
     from zarr.core.buffer import NDBuffer
     from zarr.core.indexing import SelectorTuple
@@ -68,11 +70,6 @@ __all__ = ["KvikioCodecPipeline", "release_memory"]
 _MAX_UINT_64 = 2**64 - 1
 # Byte ranges of one file closer together than this are fetched with a single read.
 _MERGE_GAP = 1 << 20
-# zarr config key of the pipeline that reads into host buffers and decodes what the GPU can't:
-# the one configured before `zarr_kvikio.enable()` (e.g. zarrs)
-HOST_PIPELINE_KEY = "zarr_kvikio.host_codec_pipeline"
-# zarr's default, which is much slower on the host than its fused pipeline
-_ZARR_DEFAULT_PIPELINE = "zarr.core.codec_pipeline.BatchedCodecPipeline"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -172,8 +169,8 @@ class KvikioCodecPipeline(BatchedCodecPipeline):
 
     Reads of arrays whose chunks are zstd-compressed (without checksum) or uncompressed,
     optionally sharded, into GPU buffers take the KvikIO/nvCOMP fast path.
-    Reads into host buffers and writes of host buffers go to the pipeline zarr was configured
-    with before (e.g. zarrs), or else to zarr's
+    Reads into host buffers and writes of host buffers go to the pipeline in zarr's config
+    ``kvikio.host_pipeline`` (e.g. zarrs), or else to zarr's
     :class:`~zarr.core.codec_pipeline.FusedCodecPipeline`, which also decodes the reads into GPU
     buffers that the GPU can't (copied afterwards).
     Writes of GPU buffers, and reads of other data types (e.g. strings) into them, go to zarr's
@@ -186,6 +183,10 @@ class KvikioCodecPipeline(BatchedCodecPipeline):
 
     # the name zarr's registry and pickle know it by
     __module__ = "zarr_kvikio"
+
+    def __getstate__(self) -> dict[str, Any]:
+        # the host pipeline is made from the zarr config of the process that reads (a Dask worker)
+        return {k: v for k, v in self.__dict__.items() if k != "_host"}
 
     @cached_property
     def _layout(self) -> _Layout | None:
@@ -227,16 +228,20 @@ class KvikioCodecPipeline(BatchedCodecPipeline):
         ):
             return await self._read_via_host(batch, out_arr, drop_axes)
         local = cast("list[Path]", paths)
-        if out_arr.nbytes < _env_int(_MIN_BYTES_ENV, _DEFAULT_MIN_BYTES):
+        _require_once()
+        if out_arr.nbytes < _int_setting(_MIN_BYTES_KEY, _DEFAULT_MIN_BYTES, 0):
             return await asyncio.to_thread(_read_host, layout, batch, local, out_arr, drop_axes)
         if not _contiguous_reads(layout, batch, out_arr, drop_axes):
             return await asyncio.to_thread(_read_gpu, layout, batch, local, out_arr, drop_axes)
+        fetch = _fetch_mode()
         # each entry is a shard file, kept open while it is read: at most this many at once
-        n = _open_files.files(_CONTIGUOUS_FDS[_fetch_mode()])
+        n = _open_files.files(_CONTIGUOUS_FDS[fetch])
         results: list[GetResult] = []
         for i in range(0, len(batch), n):
             part, part_paths = batch[i : i + n], local[i : i + n]
-            got = await asyncio.to_thread(_read_gpu_contiguous, layout, part, part_paths, out_arr)
+            got = await asyncio.to_thread(
+                _read_gpu_contiguous, layout, part, part_paths, out_arr, fetch
+            )
             if got is None:
                 got = await asyncio.to_thread(
                     _read_gpu, layout, part, part_paths, out_arr, drop_axes
@@ -314,10 +319,20 @@ class KvikioCodecPipeline(BatchedCodecPipeline):
 
 def _host_pipeline_class() -> type[CodecPipeline]:
     path = zarr.config.get(HOST_PIPELINE_KEY, None)
-    if path is None or path == _ZARR_DEFAULT_PIPELINE:
+    if path is None or path == ZARR_DEFAULT_PIPELINE:
         return FusedCodecPipeline
-    module, _, name = path.rpartition(".")
-    return getattr(importlib.import_module(module), name)
+    cls, error = None, None
+    try:
+        module, _, name = path.rpartition(".")
+        cls = getattr(importlib.import_module(module), name)
+    except (AttributeError, ImportError, ValueError) as err:
+        error = err
+    if not (isinstance(cls, type) and issubclass(cls, CodecPipeline)):
+        setting = _setting_name(HOST_PIPELINE_KEY)
+        msg = f"zarr config {setting} must name a codec pipeline, got {path!r}"
+        raise ValueError(msg) from error
+    # (ours would hand reads to itself)
+    return FusedCodecPipeline if issubclass(cls, KvikioCodecPipeline) else cls
 
 
 # ---------------------------------------------------------------------------------------------
@@ -330,29 +345,34 @@ _thread_local = threading.local()
 # object keeps (and reuses) for as long as it lives. Decoding therefore happens in calls of at most
 # this many decoded bytes, by a small pool of cached codecs per device, bounding the memory held to
 # ~3.2x that per codec. Each call also costs a few milliseconds, so larger limits are faster for
-# large reads.
-_MAX_DECODE_BYTES_ENV = "ZARR_KVIKIO_MAX_DECODE_BYTES"
+# large reads. (The settings are keys of zarr's config, e.g. ZARR_KVIKIO__MAX_DECODE_BYTES in the
+# environment.)
+_MAX_DECODE_BYTES_KEY = "kvikio.max_decode_bytes"
 _DEFAULT_MAX_DECODE_BYTES = 1 << 30
 # Codecs per device. More allow decoding from several threads at once, but reading sparse matrix
 # blocks with 10 threads per GPU was not faster with 2-4 of them,
 # and each holds its own scratch space.
-_DECODERS_ENV = "ZARR_KVIKIO_DECODERS"
+_DECODERS_KEY = "kvikio.decoders"
 _DEFAULT_DECODERS = 1
 # Reads of fewer bytes than this are decoded on the CPU (`_read_host`): every nvCOMP call has a
 # fixed cost of a few milliseconds, more than decoding e.g. a small slice of a sparse matrix's
 # `indptr` takes.
-_MIN_BYTES_ENV = "ZARR_KVIKIO_MIN_BYTES"
+_MIN_BYTES_KEY = "kvikio.min_bytes"
 _DEFAULT_MIN_BYTES = 1 << 20
+# KvikIO's thread count, a setting of the whole process (KvikIO's own default is 1), set before
+# reads with KvikIO (`_kvikio`; KVIKIO_NTHREADS replaces the default)
+_NUM_THREADS_KEY = "kvikio.num_threads"
+_DEFAULT_NUM_THREADS = 8
 # How contiguous reads of zstd-compressed sharded 1-D arrays (e.g. a sparse matrix's data and
 # indices) fetch the stored bytes: "host" reads them into pinned host memory and copies them to
 # the GPU, which is fastest when the data comes from the page cache or GPUDirect Storage runs in
 # compatibility mode; "kvikio" reads them straight into GPU memory with KvikIO (for GPUDirect
 # Storage).
-_FETCH_ENV = "ZARR_KVIKIO_FETCH"
+_FETCH_KEY = "kvikio.fetch"
 _DEFAULT_FETCH = "host"
 # Threads for host reads. Reads of at least `_PARALLEL_READ_BYTES` on average are spread over them;
 # smaller ones are faster in one thread than handed between threads competing for the GIL.
-_READ_THREADS_ENV = "ZARR_KVIKIO_READ_THREADS"
+_READ_THREADS_KEY = "kvikio.read_threads"
 _DEFAULT_READ_THREADS = 16
 _PARALLEL_READ_BYTES = 256 << 10
 # Host fetches are staged in pinned host memory, in buffers kept for later fetches. A fetch takes
@@ -368,7 +388,7 @@ _STAGING_LIMIT_BYTES = 4 << 30
 _READ_PART_BYTES = 4 << 20
 # The files reads keep open are limited, in file descriptors, to half the soft limit of open files
 # per process (often 1024), shared by all threads (`_open_files`). A KvikIO file handle takes up to
-# two; a contiguous read keeps every shard open, plus a KvikIO handle with ZARR_KVIKIO_FETCH=kvikio.
+# two; a contiguous read keeps every shard open, plus a KvikIO handle with `kvikio.fetch` "kvikio".
 _CUFILE_FDS = 2
 _CONTIGUOUS_FDS = {"host": 1, "kvikio": 1 + _CUFILE_FDS}
 # Files a read opens at once, at most
@@ -428,20 +448,45 @@ def release_memory() -> None:
 atexit.register(release_memory)
 
 
-def _env_int(name: str, default: int, minimum: int | None = None) -> int:
-    """The integer setting in environment variable `name`."""
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    try:
-        n = int(value)
-    except ValueError:
-        msg = f"{name} must be an integer, got {value!r}"
-        raise ValueError(msg) from None
-    if minimum is not None and n < minimum:
-        msg = f"{name} must be at least {minimum}, got {n}"
+def _int_setting(key: str, default: int, minimum: int) -> int:
+    """The integer setting `key` of zarr's config."""
+    n = zarr.config.get(key, default)
+    if type(n) is not int or n < minimum:
+        msg = (
+            f"zarr config {_setting_name(key)} must be an integer of at least {minimum}, got {n!r}"
+        )
         raise ValueError(msg)
     return n
+
+
+def _setting_name(key: str) -> str:
+    """`key` and the environment variable that sets it (when zarr is imported)."""
+    return f"{key!r} ({'ZARR_' + key.upper().replace('.', '__')})"
+
+
+@cache
+def _require_once() -> None:
+    """:func:`zarr_kvikio.require`, until it passes (KvikIO and nvCOMP don't go away)."""
+    require()
+
+
+_kvikio_lock = threading.Lock()
+
+
+def _kvikio() -> Any:
+    """KvikIO, reading with ``kvikio.num_threads`` threads (unless that's None)."""
+    import kvikio
+    import kvikio.defaults
+
+    if zarr.config.get(_NUM_THREADS_KEY, 0) is not None:
+        default = int(os.environ.get("KVIKIO_NTHREADS", _DEFAULT_NUM_THREADS))
+        n = _int_setting(_NUM_THREADS_KEY, default, 1)
+        if kvikio.defaults.get("num_threads") != n:
+            with _kvikio_lock:
+                if kvikio.defaults.get("num_threads") != n:
+                    # (KvikIO lets reads that run or are queued finish)
+                    kvikio.defaults.set({"num_threads": n})
+    return kvikio
 
 
 class _FileBudget:
@@ -505,7 +550,7 @@ def _pool(device_id: int) -> queue.Queue[tuple[Any, Any] | None]:
     with _pools_lock:
         if device_id not in _pools:
             # (with no codecs, decodes would wait for one forever)
-            n = _env_int(_DECODERS_ENV, _DEFAULT_DECODERS, minimum=1)
+            n = _int_setting(_DECODERS_KEY, _DEFAULT_DECODERS, 1)
             if not _pinned_pool:
                 _pinned_pool.append(cp.cuda.PinnedMemoryPool())
                 nv.set_pinned_allocator(lambda nbytes, *_: _pinned_pool[0].malloc(nbytes))
@@ -538,7 +583,7 @@ def _stream(device_id: int) -> Any:
 
 
 def _max_decode_bytes() -> int:
-    return _env_int(_MAX_DECODE_BYTES_ENV, _DEFAULT_MAX_DECODE_BYTES)
+    return _int_setting(_MAX_DECODE_BYTES_KEY, _DEFAULT_MAX_DECODE_BYTES, 1)
 
 
 def _decode(pieces: list[_Piece], stream: Any, device: Any) -> None:
@@ -731,7 +776,7 @@ def _contiguous_reads(
 
 
 def _read_gpu_contiguous(
-    layout: _Layout, batch: list[BatchInfo], paths: list[Path], out: Any
+    layout: _Layout, batch: list[BatchInfo], paths: list[Path], out: Any, fetch: str
 ) -> tuple[GetResult, ...] | None:
     """Read contiguous ranges of a sharded 1-D array.
 
@@ -742,7 +787,6 @@ def _read_gpu_contiguous(
     assert layout.inner_chunk_shape is not None
     (n,) = layout.inner_chunk_shape
     chunk_bytes = n * out.itemsize
-    fetch = _fetch_mode()
     fds: dict[Path, int] = {}
     # the shard files are open (and counted) only until their stored bytes are fetched
     # (closed before `_read_gpu` reads instead, if it has to)
@@ -901,9 +945,9 @@ def _fetch_contiguous(
 
 
 def _fetch_mode() -> str:
-    """How contiguous reads fetch the stored bytes (see `_FETCH_ENV`)."""
-    if (fetch := os.environ.get(_FETCH_ENV, _DEFAULT_FETCH)) not in _CONTIGUOUS_FDS:
-        msg = f"{_FETCH_ENV} must be 'host' or 'kvikio', got {fetch!r}"
+    """How contiguous reads fetch the stored bytes (see `_FETCH_KEY`)."""
+    if (fetch := zarr.config.get(_FETCH_KEY, _DEFAULT_FETCH)) not in _CONTIGUOUS_FDS:
+        msg = f"zarr config {_setting_name(_FETCH_KEY)} must be 'host' or 'kvikio', got {fetch!r}"
         raise ValueError(msg)
     return fetch
 
@@ -1000,7 +1044,7 @@ def _fetch_host_reads(
             return e
         return None
 
-    threads = _env_int(_READ_THREADS_ENV, _DEFAULT_READ_THREADS)
+    threads = _int_setting(_READ_THREADS_KEY, _DEFAULT_READ_THREADS, 1)
     queued = None
     if threads > 1 and len(reads) > 1 and len(host) // len(reads) >= _PARALLEL_READ_BYTES:
         if after is not None:
@@ -1020,8 +1064,7 @@ def _fetch_host_reads(
 
 
 def _fetch_kvikio(reads: list[tuple[int, int, int, int]], device_buf: Any) -> None:
-    import kvikio
-
+    kvikio = _kvikio()
     handles: dict[int, Any] = {}
     pending: list[tuple[Any, int, int, Path]] = []
     try:
@@ -1416,8 +1459,8 @@ def _byte_ranges(pieces: list[_Piece]) -> Iterator[tuple[Path, int, int, list[_P
 def _fetch(pieces: list[_Piece]) -> None:
     """Read all pieces into device memory, one KvikIO read per contiguous byte range."""
     import cupy as cp
-    import kvikio
 
+    kvikio = _kvikio()
     # (all ranges of a file in a row)
     files = [list(ranges) for _, ranges in groupby(_byte_ranges(pieces), key=lambda r: r[0])]
     for some_files in batched(files, _open_files.files(_CUFILE_FDS)):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import threading
@@ -129,15 +130,23 @@ def test_describe_memory_store(codecs, needs):
     assert needs is None or any(needs in p for p in desc["problems"])
 
 
-def test_found_by_zarr():
-    """Through the entry point, without importing zarr_kvikio first."""
+def test_found_by_zarr(tmp_path):
+    """Selected and set up in zarr's config alone (here from the environment), like zarrs."""
     code = (
-        "import sys, zarr; from zarr.registry import get_pipeline_class\n"
-        "zarr.config.set({'codec_pipeline.path': 'zarr_kvikio.KvikioCodecPipeline'})\n"
+        "import sys, numpy as np, zarr; from zarr.registry import get_pipeline_class\n"
         "assert get_pipeline_class().__name__ == 'KvikioCodecPipeline'\n"
-        "assert 'zarr_kvikio' in sys.modules  # imported by zarr"
+        "assert 'zarr_kvikio' in sys.modules  # imported by zarr, through the entry point\n"
+        "assert zarr.config.get('kvikio.min_bytes') == 0\n"
+        f"a = zarr.create_array({str(tmp_path / 'a.zarr')!r}, shape=(9,), dtype='f4')\n"
+        "a[:] = np.arange(9)  # in host memory: with zarr's fused pipeline\n"
+        "assert (a[:] == np.arange(9)).all()"
     )
-    subprocess.run([sys.executable, "-c", code], check=True)
+    env = {
+        **os.environ,
+        "ZARR_CODEC_PIPELINE__PATH": "zarr_kvikio.KvikioCodecPipeline",
+        "ZARR_KVIKIO__MIN_BYTES": "0",
+    }
+    subprocess.run([sys.executable, "-c", code], check=True, env=env)
 
 
 @pytest.mark.parametrize("error", [ImportError, AttributeError])
