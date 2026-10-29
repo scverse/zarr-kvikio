@@ -34,8 +34,9 @@ dependencies = [
   "zarr>=3.3",
 ]
 # the GPU stack: KvikIO reads, nvCOMP decodes (>= 5.2 for batched decoding into preallocated buffers)
-optional-dependencies.cuda12 = [ "cupy-cuda12x>=13", "kvikio-cu12>=26.4", "nvidia-nvcomp-cu12>=5.2" ]
-optional-dependencies.cuda13 = [ "cupy-cuda13x>=13", "kvikio-cu13>=26.4", "nvidia-nvcomp-cu13>=5.2" ]
+# (CuPy's `ctk` extra brings the CUDA runtime libraries it compiles kernels with, as KvikIO >= 26.8 does)
+optional-dependencies.cuda12 = [ "cupy-cuda12x[ctk]>=14.0.1", "kvikio-cu12>=26.4", "nvidia-nvcomp-cu12>=5.2" ]
+optional-dependencies.cuda13 = [ "cupy-cuda13x[ctk]>=14.0.1", "kvikio-cu13>=26.4", "nvidia-nvcomp-cu13>=5.2" ]
 # Client.register_plugin(..., name=...) is new in 2023.9.2
 optional-dependencies.dask = [ "distributed>=2023.9.2" ]
 urls.Changelog = "https://zarr-kvikio.readthedocs.io/page/release-notes/index.html"

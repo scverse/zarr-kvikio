@@ -12,8 +12,9 @@ Reads that can take the fast path
 4. copy the decoded values into the output buffer
    (fully selected chunks of 1-D arrays are decoded in place, without that copy).
 
-Reads of fewer than ``kvikio.min_bytes`` bytes are read and decoded on the CPU instead, and
-copied to the GPU at once. (The settings are keys of zarr's config.)
+Reads that return fewer than ``kvikio.min_bytes`` bytes are read and decoded on the CPU instead,
+and copied to the GPU at once, unless they decode at least that many from many stored chunks
+(e.g. a column of a matrix). (The settings are keys of zarr's config.)
 
 Everything else works with any store: reads into host buffers and writes of host buffers are
 delegated to a host pipeline (``kvikio.host_pipeline``, e.g. zarrs, else zarr's
@@ -137,8 +138,12 @@ def _is_device_array(arr: object) -> bool:
 
 
 def _supported_dtype(spec: ArraySpec) -> bool:
-    dtype = spec.dtype.to_native_dtype()
-    return dtype.kind in "biufcmM" and not dtype.hasobject and dtype.itemsize > 0
+    return _gpu_dtype(spec.dtype.to_native_dtype())
+
+
+def _gpu_dtype(dtype: np.dtype[Any]) -> bool:
+    """Whether the fast path decodes data of this type (numeric: CuPy has no datetimes)."""
+    return dtype.kind in "biufc" and dtype.itemsize > 0
 
 
 class _HostNDBuffer(cpu.NDBuffer):
@@ -216,7 +221,7 @@ class KvikioCodecPipeline(BatchedCodecPipeline):
         if not _is_device_array(out_arr):
             return await self._host_pipeline(batch[0][1]).read(batch, out, drop_axes)
         if not all(_supported_dtype(spec) for _, spec, *_ in batch):
-            # (e.g. structured: zarr's codecs can't decode them on the GPU)
+            # (e.g. structured ones, which zarr's codecs can't decode on the GPU)
             return await self._read_via_host(batch, out_arr, drop_axes)
         layout = self._layout
         paths = [_local_path(bg) for bg, *_ in batch]
@@ -225,12 +230,20 @@ class KvikioCodecPipeline(BatchedCodecPipeline):
             layout is None
             or any(p is None for p in paths)
             or any(spec.dtype.to_native_dtype() != out_arr.dtype for _, spec, *_ in batch)
+            or (
+                layout.compressed
+                and any(_stored_chunk_bytes(layout, s) > _NVCOMP_MAX_FRAME for _, s, *_ in batch)
+            )
         ):
             return await self._read_via_host(batch, out_arr, drop_axes)
         local = cast("list[Path]", paths)
         _require_once()
-        if out_arr.nbytes < _int_setting(_MIN_BYTES_KEY, _DEFAULT_MIN_BYTES, 0):
-            return await asyncio.to_thread(_read_host, layout, batch, local, out_arr, drop_axes)
+        min_bytes = _int_setting(_MIN_BYTES_KEY, _DEFAULT_MIN_BYTES, 0)
+        if out_arr.nbytes < min_bytes:
+            # unless it decodes many bytes from many chunks, e.g. a column of a matrix
+            decoded, chunks = _touched(layout, batch)
+            if decoded < min_bytes or chunks < _MIN_GPU_CHUNKS:
+                return await asyncio.to_thread(_read_host, layout, batch, local, out_arr, drop_axes)
         if not _contiguous_reads(layout, batch, out_arr, drop_axes):
             return await asyncio.to_thread(_read_gpu, layout, batch, local, out_arr, drop_axes)
         fetch = _fetch_mode()
@@ -354,11 +367,16 @@ _DEFAULT_MAX_DECODE_BYTES = 1 << 30
 # and each holds its own scratch space.
 _DECODERS_KEY = "kvikio.decoders"
 _DEFAULT_DECODERS = 1
-# Reads of fewer bytes than this are decoded on the CPU (`_read_host`): every nvCOMP call has a
-# fixed cost of a few milliseconds, more than decoding e.g. a small slice of a sparse matrix's
-# `indptr` takes.
+# Reads returning fewer bytes than this are decoded on the CPU (`_read_host`): every nvCOMP call
+# has a fixed cost of a few milliseconds, more than decoding e.g. a small slice of a sparse
+# matrix's `indptr` takes. Unless they decode at least that many bytes from `_MIN_GPU_CHUNKS`
+# stored chunks or more: nvCOMP decodes the chunks in parallel (each with one thread block).
 _MIN_BYTES_KEY = "kvikio.min_bytes"
 _DEFAULT_MIN_BYTES = 1 << 20
+_MIN_GPU_CHUNKS = 32
+# nvCOMP's zstd decompressor decodes frames of at most this many bytes (decoded or compressed):
+# larger stored chunks are decoded on the CPU
+_NVCOMP_MAX_FRAME = (1 << 31) - 1
 # KvikIO's thread count, a setting of the whole process (KvikIO's own default is 1), set before
 # reads with KvikIO (`_kvikio`; KVIKIO_NTHREADS replaces the default)
 _NUM_THREADS_KEY = "kvikio.num_threads"
@@ -597,9 +615,12 @@ def _decode(pieces: list[_Piece], stream: Any, device: Any) -> None:
 
 
 def _decode_into(
-    src: list[Any], dst: list[Any], sizes: list[int], stream: Any, device: Any
+    src: list[Any], dst: list[Any], sizes: list[int], stream: Any, device: Any, *, check=True
 ) -> None:
-    """Decode the zstd frames `src` into `dst` (`sizes` decoded bytes each) on a pooled codec."""
+    """Decode the zstd frames `src` into `dst` (`sizes` decoded bytes each) on a pooled codec.
+
+    Unless `check` is False (see `_check_frame_sizes`), raises if a frame decodes to another size.
+    """
     import nvidia.nvcomp as nv
 
     limit = _max_decode_bytes()
@@ -616,11 +637,16 @@ def _decode_into(
         pool.put(None)
         pool = _pool(device.id)
     codec, codec_stream = item
+    del item
+    decoded: list[Any] = []
     try:
         # the codec's stream waits for the reads/allocations queued on ours, and vice versa
         codec_stream.wait_event(stream.record())
         for a, b in groups:
-            codec.decode(nv.as_arrays(src[a:b]), out=nv.as_arrays(dst[a:b]))
+            got = codec.decode(nv.as_arrays(src[a:b]), out=nv.as_arrays(dst[a:b]))
+            if check:
+                decoded += got
+            del got  # (freed now rather than after the last decode)
     finally:
         try:
             done = codec_stream.record()
@@ -628,9 +654,59 @@ def _decode_into(
             # work queued later on the codec's stream runs after ours, so it can be reused right
             # away (and it must go back also if CUDA failed, or later decodes wait for it forever)
             pool.put((codec, codec_stream))
+            # The traceback of an error must not keep the codec (or its results, below) alive:
+            # freed after `release_memory` reset nvCOMP's allocator, they crash.
+            del codec, codec_stream
         stream.wait_event(done)
         # the buffers must stay alive until the decodes queued so far are done (also on errors)
         done.synchronize()
+        # (nvCOMP's sizes of a decode wait for it, which would hold up the next one: read now)
+        decoded_sizes = [arr.buffer_size for arr in decoded]
+        del decoded
+    # nvCOMP decodes a frame of the wrong size (e.g. of a corrupt store) without error
+    for got, n in zip(decoded_sizes, sizes if check else [], strict=True):
+        if got != n:
+            msg = f"a stored chunk decodes to {got} bytes, not {n}"
+            raise ValueError(msg)
+
+
+# The longest zstd frame header: magic number, descriptor, window, dictionary ID, content size
+_ZSTD_MAX_HEADER = 4 + 1 + 1 + 4 + 8
+
+
+def _check_frame_sizes(stored: Any, positions: np.ndarray, expected: int) -> None:
+    """Raise unless the zstd frames at `positions` in `stored` decode to `expected` bytes each.
+
+    As `_decode_into` does, but from the frames' headers at once, for reads of many frames (it
+    asks nvCOMP for each frame's size, which costs about a microsecond each).
+    """
+    import cupy as cp
+
+    if len(positions) == 0:
+        return
+    index = cp.asarray(positions)[:, None] + cp.arange(_ZSTD_MAX_HEADER)
+    sizes = _frame_content_sizes(cp.asnumpy(stored[cp.minimum(index, stored.size - 1)]))
+    if ((sizes != expected) & (sizes >= 0)).any():
+        got = sizes[(sizes != expected) & (sizes >= 0)][0]
+        msg = f"a stored chunk decodes to {got} bytes, not {expected}"
+        raise ValueError(msg)
+
+
+def _frame_content_sizes(headers: np.ndarray) -> np.ndarray:
+    """The decoded sizes the zstd frames with these headers declare (-1 if they don't)."""
+    magic = np.ascontiguousarray(headers[:, :4]).view("<u4").ravel()
+    descriptor = headers[:, 4].astype(np.int64)
+    size_flag, single_segment, dict_flag = descriptor >> 6, (descriptor >> 5) & 1, descriptor & 3
+    start = 6 - single_segment + np.array([0, 1, 2, 4])[dict_flag]
+    length = np.array([0, 2, 4, 8])[size_flag]
+    length[(size_flag == 0) & (single_segment == 1)] = 1
+    index = np.minimum(start[:, None] + np.arange(8), headers.shape[1] - 1)
+    field = np.take_along_axis(headers, index, axis=1).astype(np.uint64)
+    field[np.arange(8) >= length[:, None]] = 0
+    sizes = (field << (np.arange(8, dtype=np.uint64) * np.uint64(8))).sum(axis=1).astype(np.int64)
+    sizes[size_flag == 1] += 256
+    sizes[(length == 0) | (magic != 0xFD2FB528)] = -1
+    return sizes
 
 
 @dataclass(slots=True)
@@ -666,26 +742,84 @@ def _read_gpu(
     out: Any,
     drop_axes: tuple[int, ...],
 ) -> tuple[GetResult, ...]:
+    # (a read holds about its output in temporaries anyway, and its stored bytes; splitting one
+    # up makes its nvCOMP calls less efficient)
+    limit = max(_max_decode_bytes(), 2 * out.nbytes)
+    results: list[GetResult] = []
     with out.device as device:
         stream = _stream(device.id)
         with stream:
             pieces: list[_Piece] = []
-            entries = [
-                _plan(layout, entry, path, out, drop_axes=drop_axes, pieces=pieces)
-                for entry, path in zip(batch, paths, strict=True)
-            ]
-            _fetch(pieces)
-            if layout.compressed and pieces:
-                _decode(pieces, stream, device)
-            else:
-                for p in pieces:
-                    if p.data.size != p.target.size:
-                        msg = f"{p.path}: expected {p.target.size} bytes, found {p.data.size}"
-                        raise ValueError(msg)
-                    p.target[...] = p.data
-            results = [_scatter(e, out, drop_axes) for e in entries]
-            stream.synchronize()
+            entries: list[_Entry] = []
+            held = 0
+            for entry, path in zip(batch, paths, strict=True):
+                k = len(pieces)
+                planned = _plan(layout, entry, path, out, drop_axes=drop_axes, pieces=pieces)
+                # in groups holding at most about `limit` decoded bytes besides the output, e.g.
+                # for a column of a large matrix, which touches every chunk
+                n = _held_bytes(planned, pieces[k:])
+                if entries and held + n > limit:
+                    _read_group(
+                        layout, entries, pieces[:k], out, stream, device, drop_axes, results
+                    )
+                    entries, pieces, held = [], pieces[k:], 0
+                entries.append(planned)
+                held += n
+            _read_group(layout, entries, pieces, out, stream, device, drop_axes, results)
     return tuple(results)
+
+
+def _read_group(
+    layout: _Layout,
+    entries: list[_Entry],
+    pieces: list[_Piece],
+    out: Any,
+    stream: Any,
+    device: Any,
+    drop_axes: tuple[int, ...],
+    results: list[GetResult],
+) -> None:
+    """Fetch, decode and scatter the planned `entries`, appending their results."""
+    _fetch(pieces)
+    if layout.compressed and pieces:
+        _decode(pieces, stream, device)
+    else:
+        for p in pieces:
+            if p.data.size != p.target.size:
+                msg = f"{p.path}: expected {p.target.size} bytes, found {p.data.size}"
+                raise ValueError(msg)
+            p.target[...] = p.data
+    results.extend(_scatter(e, out, drop_axes) for e in entries)
+    # (their memory is freed next, and KvikIO may write the next group's reads into it right away)
+    stream.synchronize()
+
+
+def _held_bytes(entry: _Entry, pieces: list[_Piece]) -> int:
+    """Bytes an entry holds besides the output until it is scattered (with its `pieces`)."""
+    held = sum(p.nbytes for p in pieces)  # (stored)
+    held += sum((src if src.base is None else src.base).nbytes for *_, src in entry.copies)
+    return held + (entry.region.nbytes if entry.region is not None else 0)
+
+
+def _stored_chunk_bytes(layout: _Layout, spec: ArraySpec) -> int:
+    """Decoded bytes of one stored chunk (an inner chunk, if sharded)."""
+    shape = layout.inner_chunk_shape or tuple(spec.shape)
+    return prod(shape) * spec.dtype.to_native_dtype().itemsize
+
+
+def _touched(layout: _Layout, batch: list[BatchInfo]) -> tuple[int, int]:
+    """The decoded bytes and the number of the stored chunks a read touches."""
+    nbytes = chunks = 0
+    for _, spec, chunk_sel, _, _ in batch:
+        shape = tuple(spec.shape)
+        stored = layout.inner_chunk_shape or shape
+        n = prod(
+            len(_touched_chunks(s, c, m // c))
+            for s, c, m in zip(_normalize(chunk_sel, shape), stored, shape, strict=True)
+        )
+        nbytes += n * _stored_chunk_bytes(layout, spec)
+        chunks += n
+    return nbytes, chunks
 
 
 def _read_host(
@@ -711,13 +845,13 @@ def _read_host(
     _fetch_host(pieces)
     codec = Zstd() if layout.compressed else None
     for p in pieces:
-        if codec is not None:
-            codec.decode(p.data, out=p.target)
-        elif p.data.size != p.target.size:
-            msg = f"{p.path}: expected {p.target.size} bytes, found {p.data.size}"
+        # (decoded to its own buffer: a frame of the wrong size, e.g. of a corrupt store, would
+        # fill `target` partly without error)
+        data = np.frombuffer(codec.decode(p.data), np.uint8) if codec is not None else p.data
+        if data.size != p.target.size:
+            msg = f"{p.path}: expected {p.target.size} bytes, found {data.size}"
             raise ValueError(msg)
-        else:
-            p.target[...] = p.data
+        p.target[...] = data
     results = tuple(_scatter(e, host, drop_axes) for e in entries)
     if out.flags.c_contiguous or out.flags.f_contiguous:
         out.set(host)
@@ -818,7 +952,9 @@ def _read_gpu_contiguous(
             [chunk_bytes] * len(src_ptrs),
             stream,
             device,
+            check=False,
         )
+        _check_frame_sizes(stored, positions, chunk_bytes)
         for k, (a, b, out_a, out_b) in enumerate(plan.copies):
             out[out_a:out_b] = temp[k * n + a : k * n + b]
         stream.synchronize()

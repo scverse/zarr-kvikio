@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
     from distributed import Client
 
-__all__ = ["KvikioPlugin", "enable"]
+__all__ = ["enable"]
 
 # zarr's settings are shared by all workers in a process (and with the client, for in-process
 # workers), so what enable() and the plugins change in a process is undone in reverse
@@ -61,9 +61,9 @@ def enable(client: Client) -> _ClusterConfigSet:
     settings = {f"kvikio.{k}": v for k, v in copy.deepcopy(zarr.config.get("kvikio", {})).items()}
     settings |= {"codec_pipeline.path": PIPELINE_PATH, **GPU_BUFFERS, **host}
     # a name of its own, so that undoing this call leaves other calls in effect
-    name = f"{KvikioPlugin.name}-{uuid.uuid4().hex}"
+    name = f"{_KvikioPlugin.name}-{uuid.uuid4().hex}"
     try:
-        client.register_plugin(KvikioPlugin(settings), name=name)
+        client.register_plugin(_KvikioPlugin(settings), name=name)
     except Exception:
         # distributed keeps a plugin that a worker fails to set up (on the scheduler and on the
         # workers that did set it up). Not on e.g. Ctrl-C, which must not wait for the workers
@@ -77,7 +77,7 @@ def enable(client: Client) -> _ClusterConfigSet:
     return _ClusterConfigSet(local, client, name)
 
 
-class KvikioPlugin(WorkerPlugin):
+class _KvikioPlugin(WorkerPlugin):
     """Make a Dask worker read zarr arrays into GPU memory with KvikIO and nvCOMP.
 
     Usually used through :func:`zarr_kvikio.dask.enable`.

@@ -31,6 +31,14 @@ jobs:
         run: uv build
       - name: Check package
         run: uvx twine check --strict dist/*
+      # (hatch-vcs reads the version from the tag: a tag it can't read gives a dev version)
+      - name: Check the version is the tag's
+        run: >-
+          uv run --isolated --no-project --with packaging python -c "import glob, sys; from packaging.version import Version;
+          built = glob.glob('dist/zarr_kvikio-*.tar.gz')[0][len('dist/zarr_kvikio-'):-len('.tar.gz')];
+          sys.exit(f'built {built} from tag {sys.argv[1]}' if Version(built) != Version(sys.argv[1]) else 0)" "$TAG"
+        env:
+          TAG: ${{ github.ref_name }}
       # the installed wheel's entry point loads the pipeline, and zarr works with it installed
       - name: Check entry point
         run: >-

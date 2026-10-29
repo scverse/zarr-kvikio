@@ -24,7 +24,7 @@ CLUSTERS = [
 
 def plugins(client: distributed.Client) -> list[str]:
     names = client.run_on_scheduler(lambda dask_scheduler: list(dask_scheduler.worker_plugins))
-    return [n for n in names if n.startswith(zarr_kvikio.dask.KvikioPlugin.name)]
+    return [n for n in names if n.startswith(zarr_kvikio.dask._KvikioPlugin.name)]
 
 
 @pytest.fixture
@@ -92,21 +92,21 @@ def test_enable_undo_errors(client, state, monkeypatch):
     # this process is restored even when the workers can't be reached
     enabled = zarr_kvikio.dask.enable(client)
     monkeypatch.setattr(client, "unregister_worker_plugin", unreachable)
-    with pytest.raises(OSError, match=zarr_kvikio.dask.KvikioPlugin.name):
+    with pytest.raises(OSError, match=zarr_kvikio.dask._KvikioPlugin.name):
         enabled.__exit__(None, None, None)
     assert state() == before
 
 
 @pytest.mark.parametrize("client", CLUSTERS[1:2], indirect=True)
 def test_enable_setup_fails(client, state, monkeypatch):
-    setup = zarr_kvikio.dask.KvikioPlugin.setup
+    setup = zarr_kvikio.dask._KvikioPlugin.setup
 
     def setup_fails_on_second_worker(self, worker) -> None:
         if worker.name == 1:
             raise RuntimeError("no GPU")
         setup(self, worker)
 
-    monkeypatch.setattr(zarr_kvikio.dask.KvikioPlugin, "setup", setup_fails_on_second_worker)
+    monkeypatch.setattr(zarr_kvikio.dask._KvikioPlugin, "setup", setup_fails_on_second_worker)
     before = state()
     with pytest.raises(RuntimeError, match="no GPU"):
         zarr_kvikio.dask.enable(client)

@@ -10,7 +10,14 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from ._config import available
-from ._pipeline import _MAX_UINT_64, KvikioCodecPipeline, _layout_of, _read_shard_index
+from ._pipeline import (
+    _MAX_UINT_64,
+    _NVCOMP_MAX_FRAME,
+    KvikioCodecPipeline,
+    _gpu_dtype,
+    _layout_of,
+    _read_shard_index,
+)
 
 if TYPE_CHECKING:
     import zarr
@@ -70,6 +77,14 @@ def describe(arr: zarr.Array) -> dict[str, Any]:
             f"codecs {desc['codecs']} cannot be decoded on the GPU (needs zarr v3 with "
             "little-endian bytes, zstd without checksum or no compression, and no other codecs)"
         )
+    dtype_ok = _gpu_dtype(np.dtype(arr.dtype))
+    if not dtype_ok:
+        problems.append(
+            f"data type {arr.dtype} is decoded on the CPU (the GPU decodes fixed-size numeric ones)"
+        )
+    too_large = layout is not None and layout.compressed and desc["chunk_bytes"] > _NVCOMP_MAX_FRAME
+    if too_large:
+        problems.append("chunks of 2 GiB or more are decoded on the CPU (nvCOMP's limit)")
     if type(arr.store) is not LocalStore:  # (the exact type, as in `_local_path`)
         problems.append(
             f"stored in a {type(arr.store).__name__}, not a LocalStore: "
@@ -87,7 +102,7 @@ def describe(arr: zarr.Array) -> dict[str, Any]:
             "the chunks inside its shards are stored out of order (as zarrs writes them), "
             "so a contiguous range needs many small reads"
         )
-    desc["gpu_readable"] = layout is not None
+    desc["gpu_readable"] = layout is not None and dtype_ok and not too_large
     desc["problems"] = problems
     return desc
 

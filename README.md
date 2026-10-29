@@ -12,7 +12,8 @@ A [zarr-python](https://github.com/zarr-developers/zarr-python) codec pipeline t
 straight into GPU memory with [KvikIO](https://github.com/rapidsai/kvikio) and decodes them with [nvCOMP](https://developer.nvidia.com/nvcomp).
 Reads it can't do on the GPU fall back to zarr's own pipelines, so any array can be read.
 
-Status: beta. Used by [rapids-singlecell](https://rapids-singlecell.scverse.org/)'s out-of-core reading (`rapids_singlecell.io`).
+Status: beta. Made for [rapids-singlecell](https://rapids-singlecell.scverse.org/)'s upcoming out-of-core reading
+(`rapids_singlecell.io`).
 
 ## Installation
 
@@ -109,8 +110,11 @@ the settings of the process it runs in as they are then, except for `kvikio.deco
   nvCOMP's batched zstd decode needs about **3.2× the decoded size as scratch space**,
   and its codec keeps that memory for reuse, so this bounds the device memory held (≈3.4 GB by default).
   Each call also costs a few milliseconds, so a larger limit speeds up very large reads.
-- **`kvikio.min_bytes`** (default 1 MiB): smaller reads are read and zstd-decoded on the CPU by zarr-kvikio itself
-  and copied to the GPU at once.
+  A read that decodes much more than it returns, e.g. a column of a large matrix (whose chunks it all decodes), does
+  so in parts holding about this many bytes (or twice its output's size, if larger) at once.
+- **`kvikio.min_bytes`** (default 1 MiB): reads that return fewer bytes are read and zstd-decoded on the CPU by
+  zarr-kvikio itself and copied to the GPU at once, unless they decode at least that many bytes from 32 or more chunks
+  (e.g. a column of a matrix).
   Every nvCOMP call has a fixed cost of a few milliseconds, more than decoding e.g. a small slice of a sparse matrix's `indptr`.
 - **`kvikio.decoders`** (default 1): nvCOMP codecs per GPU, each with its own scratch space.
   More let several threads decode at once; for sparse-matrix reads from 10 threads per GPU, 2-4 were not faster.
@@ -143,13 +147,14 @@ A read takes the fast path, which reads the stored bytes with KvikIO (or into pi
 `kvikio.fetch`) and decodes them on the GPU with nvCOMP (uncompressed ones are copied), when all of these hold:
 
 - the output is a GPU buffer of the array's data type (`zarr.config.enable_gpu()` with the pipeline selected, or
-  `zarr_kvikio.enable()`) of at least `kvikio.min_bytes` (smaller reads are decoded on the CPU by zarr-kvikio and then
-  copied),
+  `zarr_kvikio.enable()`) of at least `kvikio.min_bytes`, or the read decodes that many bytes from many chunks (others
+  are decoded on the CPU by zarr-kvikio and then copied),
 - the array lives in a `zarr.storage.LocalStore`,
-- the array is zarr v3 with a fixed-size numeric dtype, and
+- the array is zarr v3 with a fixed-size numeric dtype (not datetimes, which CuPy doesn't hold),
 - its codecs are `bytes` (little endian), optionally followed by `zstd` (without checksum),
   either directly or as the inner codecs of the `sharding_indexed` codec
-  (index codecs `bytes` + optional `crc32c`, index at the start or end).
+  (index codecs `bytes` + optional `crc32c`, index at the start or end), and
+- its (inner) chunks are smaller than 2 GiB if zstd-compressed (nvCOMP's limit).
 
 Everything else, including reads into host buffers and writes of host buffers, is handled by `kvikio.host_pipeline`
 (e.g. zarrs), or else zarr's `FusedCodecPipeline`. Reads into GPU buffers of arrays the GPU can't decode (e.g. blosc,
@@ -185,8 +190,8 @@ How a fast read works:
 
 `convert_array` writes this layout (zstd, ~256 KiB chunks: whole rows of a 2-D array or row pieces, 512 chunks per
 shard, in order; optionally with a smaller dtype, e.g. uint16 indices), and `describe` reports what an existing array
-lacks. For whole AnnData stores, use [`rapids_singlecell.io.convert_zarr`](https://rapids-singlecell.scverse.org/),
-which converts every matrix this way and copies everything else.
+lacks. For whole AnnData stores, rapids-singlecell's upcoming `rapids_singlecell.io.convert_zarr` converts every matrix
+this way and copies everything else.
 
 `convert_array` returns the new array, opened with the codec pipeline zarr is configured with (e.g. the GPU one after
 `enable()`). It runs one conversion at a time, because zarr's config is process-wide: while one runs, zarr reads in

@@ -182,6 +182,7 @@ def test_decode_errors_return_the_codec(monkeypatch, nvcomp, fault):
         if fault == "decode" and log.count("decode") == 2:
             msg = "decode failed"
             raise RuntimeError(msg)
+        return [SimpleNamespace(buffer_size=len(o)) for o in out]  # (the decoded sizes)
 
     codec = SimpleNamespace(decode=decode)
     pool = queue.Queue()
@@ -523,13 +524,13 @@ def test_contiguous_reads_close_files_before_decoding(tmp_path, monkeypatch, fet
     monkeypatch.setattr(_pipeline, "_open_files", budget := _pipeline._FileBudget(64))
     decode, held = _pipeline._decode_into, []
 
-    def spy(*args):
+    def spy(*args, **kwargs):
         files = 0
         for fd in Path("/proc/self/fd").iterdir():
             with suppress(OSError):  # (e.g. the one listing them, closed by now)
                 files += str(fd.readlink()).startswith(str(tmp_path))
         held.append((budget._used, files))
-        return decode(*args)
+        return decode(*args, **kwargs)
 
     monkeypatch.setattr(_pipeline, "_decode_into", spy)
     data = rng.random(4000).astype("float32")

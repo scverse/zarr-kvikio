@@ -117,13 +117,17 @@ def test_describe_unordered_shards(tmp_path):
         pytest.param({}, None, id="zstd"),
         pytest.param({"compressors": [ZstdCodec(checksum=True)]}, "without checksum", id="crc"),
         pytest.param({"serializer": BytesCodec(endian="big")}, "little-endian", id="big-endian"),
+        pytest.param({"dtype": "U4"}, "data type", id="string"),
+        pytest.param({"dtype": "M8[s]"}, "data type", id="datetime"),  # (not in CuPy)
+        pytest.param({"max_frame": 39}, "2 GiB", id="large-chunks"),  # (chunks of 40 bytes)
     ],
 )
-def test_describe_memory_store(codecs, needs):
+def test_describe_memory_store(monkeypatch, codecs, needs):
     """Only arrays in a LocalStore are read with KvikIO and decoded on the GPU."""
-    arr = zarr.create_array(
-        zarr.storage.MemoryStore(), shape=(100,), dtype="f4", chunks=(10,), shards=(100,), **codecs
-    )
+    if "max_frame" in codecs:
+        monkeypatch.setattr(zarr_kvikio._check, "_NVCOMP_MAX_FRAME", codecs.pop("max_frame"))
+    settings = {"shape": (100,), "dtype": "f4", "chunks": (10,), "shards": (100,), **codecs}
+    arr = zarr.create_array(zarr.storage.MemoryStore(), **settings)
     desc = zarr_kvikio.describe(arr)
     assert desc["gpu_readable"] == (needs is None)
     assert any("not a LocalStore" in p for p in desc["problems"])

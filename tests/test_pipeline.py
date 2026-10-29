@@ -423,19 +423,73 @@ def test_dask_enable(tmp_path, read_path):
 
 
 @pytest.mark.parametrize("read_path", ["gpu"], indirect=True)  # (sets the threshold itself)
-def test_small_reads_decoded_on_host(tmp_path, fast_path_calls):
+@pytest.mark.parametrize(
+    ("selection", "path"),
+    [
+        pytest.param(slice(1000, 5000), "_read_host", id="small"),  # 16 KB
+        # a few values from all 64 chunks (4 MiB) / from 8 of them (512 KiB)
+        pytest.param(np.arange(0, 1 << 20, 4099), "_read_gpu", id="many-chunks"),
+        pytest.param(np.arange(0, 1 << 20, 1 << 17), "_read_host", id="few-chunks"),
+        pytest.param(slice(None), "_read_gpu_contiguous", id="large"),  # 4 MiB
+    ],
+)
+def test_small_reads_decoded_on_host(tmp_path, fast_path_calls, selection, path):
+    """Unless they decode many bytes from many chunks."""
     zarr.config.set({"kvikio.min_bytes": 1 << 20})
-    data = rng.random(1 << 20).astype("float32")  # 4 MiB
-    write(tmp_path / "a.zarr", data, (1 << 16,), shards=(1 << 18,))
+    data = rng.random(1 << 20).astype("float32")
+    write(tmp_path / "a.zarr", data, (1 << 14,), shards=(1 << 18,))
     with warnings.catch_warnings():
         # not through zarr's own pipeline, which warns about copying each chunk to the GPU
         warnings.simplefilter("error")
-        check(tmp_path / "a.zarr", slice(1000, 5000))  # 16 KB
-        check(tmp_path / "a.zarr", (np.arange(0, 1 << 20, 4099),), how="oindex")
-    assert set(fast_path_calls) == {"_read_host"}
-    fast_path_calls.clear()
-    check(tmp_path / "a.zarr", slice(None))  # 4 MiB
-    assert fast_path_calls == ["_read_gpu_contiguous"]
+        check(tmp_path / "a.zarr", (selection,), how="oindex")
+    assert fast_path_calls == [path]
+
+
+@pytest.mark.parametrize("shards", [None, (500, 20)], ids=["unsharded", "sharded"])
+def test_thin_reads_decode_in_parts(tmp_path, monkeypatch, read_path, shards):
+    """A column touches every chunk: decoded a few at a time, not all at once."""
+    zarr.config.set({"kvikio.max_decode_bytes": 3 * 100 * 20 * 4})  # (3 chunks)
+    fetch, fetches = _pipeline._fetch, []
+    monkeypatch.setattr(_pipeline, "_fetch", lambda pieces: fetches.append(1) or fetch(pieces))
+    data = rng.random((1000, 20)).astype("float32")
+    write(tmp_path / "a.zarr", data, (100, 20), shards=shards)
+    check(tmp_path / "a.zarr", (slice(None), 3))
+    if read_path == "gpu":  # (10 chunks, or 2 shards of 5)
+        assert 1 < len(fetches) <= (10 if shards is None else 2)
+
+
+@pytest.mark.parametrize("sharded", [False, True], ids=["unsharded", "sharded"])
+@pytest.mark.parametrize("values", [500, 2000], ids=["short", "long"])
+def test_wrong_size_chunks_raise(tmp_path, values, sharded):
+    """Of a corrupt store: instead of returning what the memory held."""
+    import google_crc32c
+    from numcodecs import Zstd
+
+    shards = (2000,) if sharded else None
+    write(tmp_path / "a.zarr", rng.random(4000).astype("float32"), (1000,), shards=shards)
+    wrong = Zstd().encode(np.zeros(values, "float32"))
+    if sharded:  # (inner chunks of 1000 values; the index at the end, with a checksum)
+        right = Zstd().encode(np.zeros(1000, "float32"))
+        index = np.array([[0, len(wrong)], [len(wrong), len(right)]], "<u8").tobytes()
+        wrong += right + index + google_crc32c.value(index).to_bytes(4, "little")
+    (tmp_path / "a.zarr" / "c" / "0").write_bytes(wrong)
+    with pytest.raises(ValueError, match=f"{4 * values}") as error:
+        read_gpu(tmp_path / "a.zarr", slice(0, 2000))
+    # nothing of nvCOMP's lives on with the error: freed after `release_memory`, it crashes
+    tb = error.tb
+    while tb is not None:
+        held = [type(v) for v in tb.tb_frame.f_locals.values()]
+        assert not [t for t in held if t.__module__.startswith("nvidia.nvcomp")], held
+        tb = tb.tb_next
+
+
+def test_large_chunks_fall_back(tmp_path, monkeypatch, fast_path_calls, fused_reads):
+    """nvCOMP decodes zstd frames of less than 2 GiB."""
+    monkeypatch.setattr(_pipeline, "_NVCOMP_MAX_FRAME", 399)  # (chunks of 400 bytes)
+    write(tmp_path / "a.zarr", rng.random(1000).astype("float32"), (100,), shards=(500,))
+    check(tmp_path / "a.zarr", slice(None))
+    assert not fast_path_calls
+    assert fused_reads
 
 
 @pytest.mark.parametrize("decoders", [1, 3])
