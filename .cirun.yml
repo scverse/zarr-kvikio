@@ -1,0 +1,13 @@
+runners:
+  # T4 for the GPU tests (test-gpu.yaml): scverse-standard AMI, eu-west-1.
+  # Only T4 capacity is available; g5 (A10G) and g6 (L4) are not.
+  - name: aws-gpu-runner-g4dn
+    cloud: aws
+    instance_type: g4dn.xlarge
+    machine_image: ami-0756bd122da9b2618
+    region: eu-west-1
+    preemptible:
+      - true
+      - false
+    labels:
+      - cirun-aws-gpu-t4

@@ -1,0 +1,120 @@
+name: GPU Tests
+
+# GitHub's runners have no GPU: these run on a T4 through cirun (see .cirun.yml), for pushes to
+# main, weekly (e.g. for new zarr releases), and for pull requests labelled 'run-gpu-ci' (or
+# 'skip-gpu-ci' to skip them; 'run-gpu-ci' is removed after a run). Fork pull requests should need
+# approval to run workflows (Settings > Actions: "Require approval for all external contributors").
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [labeled, opened, synchronize]
+  schedule:
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  # (pushes, weekly and manual runs don't cancel each other)
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || format('{0}-{1}', github.ref, github.event_name) }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.mode.outputs.skip }}
+    steps:
+      - name: Require a push to main, or the 'run-gpu-ci' or 'skip-gpu-ci' label
+        id: mode
+        env:
+          RUN: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-gpu-ci') }}
+          SKIP: ${{ contains(github.event.pull_request.labels.*.name, 'skip-gpu-ci') }}
+        run: |
+          if [[ "$RUN" == "true" ]]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          elif [[ "$SKIP" == "true" ]]; then
+            echo "::notice::GPU tests skipped by the 'skip-gpu-ci' label."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::GPU tests need a push to main, or the 'run-gpu-ci' or 'skip-gpu-ci' label."
+            exit 1
+          fi
+
+  test:
+    name: Test (Python ${{ matrix.python }}, CUDA ${{ matrix.cuda }}${{ matrix.pre && ', pre-releases' || '' }})
+    needs: check
+    if: needs.check.outputs.skip != 'true'
+    runs-on: cirun-aws-gpu-t4
+    timeout-minutes: 30
+    # (catches zarr releases that move its internals early; the weekly run fails visibly)
+    continue-on-error: ${{ matrix.pre && github.event_name != 'schedule' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { python: "3.12", cuda: "12", pre: false }
+          - { python: "3.14", cuda: "13", pre: false }
+          - { python: "3.14", cuda: "13", pre: true }
+    permissions:
+      contents: read
+      id-token: write # for codecov OIDC
+    env:
+      CUDA: ${{ matrix.cuda }}
+      UV_PRERELEASE: ${{ matrix.pre && 'allow' || 'if-necessary' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          filter: blob:none
+          fetch-depth: 0 # the version comes from git tags
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: ${{ matrix.python }}
+      - run: nvidia-smi
+      - name: Install
+        run: uv sync --extra "cuda$CUDA" --extra dask --group test
+      # without a usable GPU stack the GPU tests would skip, and the job pass
+      - name: Check the GPU stack
+        run: uv run --no-sync python -c "import cupy, zarr_kvikio; zarr_kvikio.require(); cupy.arange(1).sum(); print(zarr_kvikio.check())"
+      - name: Run tests
+        run: uv run --no-sync pytest -v --color=yes --cov --cov-report=xml
+      - name: Upload coverage
+        if: ${{ !matrix.pre }}
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          files: coverage.xml
+          flags: gpu
+          fail_ci_if_error: true
+          use_oidc: true
+
+  # one check to require in branch protection
+  gpu-tests-pass:
+    name: GPU tests pass
+    if: always()
+    needs: [check, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe # v1.2.2
+        with:
+          allowed-skips: test
+          jobs: ${{ toJSON(needs) }}
+
+  remove-label:
+    name: Remove the 'run-gpu-ci' label
+    if: ${{ always() && github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-gpu-ci') }}
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Remove the label, so that every run on cirun is asked for again
+        run: >-
+          gh api -X DELETE "repos/$REPO/issues/$PR/labels/run-gpu-ci"
+          || echo "::warning::Could not remove the 'run-gpu-ci' label (e.g. of a fork pull request): remove it by hand."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}

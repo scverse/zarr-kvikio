@@ -11,6 +11,12 @@ coverage:
     patch: false
     changes: false
 
+# the GPU tests run for pushes to main and labelled pull requests: their coverage is carried forward
+flag_management:
+  individual_flags:
+    - name: gpu
+      carryforward: true
+
 comment:
   layout: diff, flags, files
   behavior: once

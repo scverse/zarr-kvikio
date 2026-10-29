@@ -49,7 +49,7 @@ entry-points."zarr.codec_pipeline"."zarr_kvikio.KvikioCodecPipeline" = "_zarr_kv
 
 [dependency-groups]
 dev = [ "twine>=4.0.2" ]
-test = [ "coverage>=7.10", "distributed", "pytest", "pytest-cov" ]
+test = [ "coverage>=7.10", "distributed", "pytest", "pytest-cov", "zarrs" ]  # (zarrs as the host pipeline)
 doc = [
   "ipykernel",
   "ipython",

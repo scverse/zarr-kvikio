@@ -237,6 +237,10 @@ The CI job is defined in `.github/workflows/test.yaml`,
 however the single point of truth for CI jobs is the Hatch test matrix defined in `pyproject.toml`.
 This means that local testing via hatch and remote testing on CI tests against the same python versions and uses the same environments.
 
+GitHub's runners have no GPU: the GPU tests (`.github/workflows/test-gpu.yaml`) run on a T4 through [cirun](https://cirun.io)
+for pushes to main, weekly, and for pull requests a maintainer labels `run-gpu-ci` (or `skip-gpu-ci`), which is removed
+after a run.
+
 ## Publishing a release
 
 ### Updating the version number

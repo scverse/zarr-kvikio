@@ -250,8 +250,10 @@ hatch run docs:build
 uv run --extra cuda13 --extra dask --group test pytest  # with the GPU tests (or --extra cuda12)
 ```
 
-The tests compare every read against zarr's default CPU pipeline. GitHub's runners have no GPU, so CI runs the
-CPU tests, the type check, the lint hooks and a build; run the GPU tests locally before a release.
+The tests compare every read against zarr's default CPU pipeline. CI runs the CPU tests, the type check, the lint hooks
+and a build on GitHub's runners, and the GPU tests on a T4 through [cirun](https://cirun.io) (`test-gpu.yaml`): for
+pushes to `main`, weekly, and for pull requests labelled `run-gpu-ci` (or `skip-gpu-ci`; the label is removed after a
+run).
 
 To release, publish a GitHub release with a tag `vX.Y.Z`: the version comes from the tag
 (hatch-vcs), and `release.yaml` uploads it to PyPI through trusted publishing.
