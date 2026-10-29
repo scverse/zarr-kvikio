@@ -4,15 +4,23 @@ Reads that can take the fast path
 
 1. read the (small) shard indices on the host,
 2. read every needed chunk's compressed bytes straight into device memory with KvikIO,
-   one read per contiguous byte range (i.e. typically one read per shard),
-3. decode all chunks of the request in a single batched nvCOMP call,
+   one read per contiguous byte range (i.e. typically one read per shard); contiguous ranges of
+   zstd-compressed sharded 1-D arrays are read into pinned host memory and copied instead, by
+   default (``ZARR_KVIKIO_FETCH``),
+3. decode the chunks of the request in batched nvCOMP calls of at most
+   ``ZARR_KVIKIO_MAX_DECODE_BYTES`` decoded bytes each (usually a single call),
 4. copy the decoded values into the output buffer
    (fully selected chunks of 1-D arrays are decoded in place, without that copy).
 
-Everything else works with any store: reads into host buffers and writes are delegated to a host
-pipeline (the one zarr was configured with before, e.g. zarrs, else zarr's
+Reads of fewer than ``ZARR_KVIKIO_MIN_BYTES`` bytes are read and decoded on the CPU instead, and
+copied to the GPU at once.
+
+Everything else works with any store: reads into host buffers and writes of host buffers are
+delegated to a host pipeline (the one zarr was configured with before, e.g. zarrs, else zarr's
 :class:`~zarr.core.codec_pipeline.FusedCodecPipeline`), and reads into GPU buffers the GPU can't
 decode (e.g. blosc-compressed or remote chunks) are decoded by it on the host and then copied.
+Writes of GPU buffers, and reads of other data types (e.g. strings) into them, use zarr's
+:class:`~zarr.core.codec_pipeline.BatchedCodecPipeline`.
 """
 
 from __future__ import annotations
@@ -24,10 +32,11 @@ import os
 import queue
 import sys
 import threading
-from contextlib import suppress
+from collections import deque
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from functools import cached_property
-from itertools import product
+from itertools import batched, chain, groupby, product
 from math import prod
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -44,7 +53,7 @@ from zarr.core.codec_pipeline import BatchedCodecPipeline, FusedCodecPipeline
 from zarr.storage import LocalStore, StorePath
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Sequence
 
     from zarr.abc.codec import ArrayArrayCodec, ArrayBytesCodec, BytesBytesCodec, CodecPipeline
     from zarr.abc.store import ByteGetter, ByteSetter, Store
@@ -163,9 +172,12 @@ class KvikioCodecPipeline(BatchedCodecPipeline):
 
     Reads of arrays whose chunks are zstd-compressed (without checksum) or uncompressed,
     optionally sharded, into GPU buffers take the KvikIO/nvCOMP fast path.
-    Everything else is handled by the pipeline zarr was configured with before
-    (e.g. zarrs), or else by zarr's :class:`~zarr.core.codec_pipeline.FusedCodecPipeline`,
-    so the pipeline works with any array.
+    Reads into host buffers and writes of host buffers go to the pipeline zarr was configured
+    with before (e.g. zarrs), or else to zarr's
+    :class:`~zarr.core.codec_pipeline.FusedCodecPipeline`, which also decodes the reads into GPU
+    buffers that the GPU can't (copied afterwards).
+    Writes of GPU buffers, and reads of other data types (e.g. strings) into them, go to zarr's
+    :class:`~zarr.core.codec_pipeline.BatchedCodecPipeline`. So the pipeline works with any array.
 
     zarr finds it (as ``"zarr_kvikio.KvikioCodecPipeline"``) through an entry point.
     The pipeline is bound when an array is opened, so select it before opening,
@@ -207,16 +219,30 @@ class KvikioCodecPipeline(BatchedCodecPipeline):
             return await super().read(batch, out, drop_axes)
         layout = self._layout
         paths = [_local_path(bg) for bg, *_ in batch]
-        if layout is None or any(p is None for p in paths):
+        # (zarr also takes an `out` of another dtype: `_read_via_host` casts into it)
+        if (
+            layout is None
+            or any(p is None for p in paths)
+            or any(spec.dtype.to_native_dtype() != out_arr.dtype for _, spec, *_ in batch)
+        ):
             return await self._read_via_host(batch, out_arr, drop_axes)
         local = cast("list[Path]", paths)
-        if out_arr.nbytes < int(os.environ.get(_MIN_BYTES_ENV, _DEFAULT_MIN_BYTES)):
+        if out_arr.nbytes < _env_int(_MIN_BYTES_ENV, _DEFAULT_MIN_BYTES):
             return await asyncio.to_thread(_read_host, layout, batch, local, out_arr, drop_axes)
-        if _contiguous_reads(layout, batch, out_arr, drop_axes):
-            results = await asyncio.to_thread(_read_gpu_contiguous, layout, batch, local, out_arr)
-            if results is not None:
-                return results
-        return await asyncio.to_thread(_read_gpu, layout, batch, local, out_arr, drop_axes)
+        if not _contiguous_reads(layout, batch, out_arr, drop_axes):
+            return await asyncio.to_thread(_read_gpu, layout, batch, local, out_arr, drop_axes)
+        # each entry is a shard file, kept open while it is read: at most this many at once
+        n = _open_files.files(_CONTIGUOUS_FDS[_fetch_mode()])
+        results: list[GetResult] = []
+        for i in range(0, len(batch), n):
+            part, part_paths = batch[i : i + n], local[i : i + n]
+            got = await asyncio.to_thread(_read_gpu_contiguous, layout, part, part_paths, out_arr)
+            if got is None:
+                got = await asyncio.to_thread(
+                    _read_gpu, layout, part, part_paths, out_arr, drop_axes
+                )
+            results.extend(got)
+        return tuple(results)
 
     async def write(
         self,
@@ -236,19 +262,28 @@ class KvikioCodecPipeline(BatchedCodecPipeline):
         """The host pipeline for this array."""
         if (pipeline := self.__dict__.get("_host")) is None:
             host_cls = _host_pipeline_class()
+            codecs: list[ArrayArrayCodec | ArrayBytesCodec | BytesBytesCodec] = [
+                *self.array_array_codecs,
+                self.array_bytes_codec,
+                *self.bytes_bytes_codecs,
+            ]
+            # (zarr's batched pipeline, which zarrs falls back to and builds from codecs, can't
+            # read shards into host buffers while GPU buffers are the default: the fused one can)
             if (array := self.__dict__.get("_array")) is not None:
                 metadata, store = array
                 with suppress(NotImplementedError):  # e.g. zarrs is built from these
                     pipeline = host_cls.from_array_metadata_and_store(
                         array_metadata=metadata, store=store
                     )
+                if type(getattr(pipeline, "python_impl", None)) is BatchedCodecPipeline:
+                    fallback = FusedCodecPipeline.from_codecs(codecs)
+                    cast("Any", pipeline).python_impl = fallback.evolve_from_array_spec(
+                        _on_host(spec)
+                    )
             if pipeline is None:
-                codecs: list[ArrayArrayCodec | ArrayBytesCodec | BytesBytesCodec] = [
-                    *self.array_array_codecs,
-                    self.array_bytes_codec,
-                    *self.bytes_bytes_codecs,
-                ]
                 pipeline = host_cls.from_codecs(codecs)
+                if type(pipeline) is BatchedCodecPipeline:
+                    pipeline = FusedCodecPipeline.from_codecs(codecs)
                 pipeline = pipeline.evolve_from_array_spec(_on_host(spec))
             # (a frozen dataclass: cache it the way `cached_property` does)
             self.__dict__["_host"] = pipeline
@@ -260,13 +295,20 @@ class KvikioCodecPipeline(BatchedCodecPipeline):
         """Decode chunks the GPU can't on the host, then copy them into the GPU buffer."""
         import cupy as cp
 
-        host = _HostNDBuffer.from_numpy_array(np.empty(out_arr.shape, dtype=out_arr.dtype))
+        pipeline = self._host_pipeline(batch[0][1])
+        dtype = out_arr.dtype
+        if not isinstance(pipeline, BatchedCodecPipeline | FusedCodecPipeline):
+            # others (e.g. zarrs) may not cast into `out`: decoded in the array's dtype then, and
+            # cast on the host (CuPy has no datetime dtypes)
+            dtype = batch[0][1].dtype.to_native_dtype().newbyteorder("=")
+        host = _HostNDBuffer.from_numpy_array(np.empty(out_arr.shape, dtype=dtype))
         host_batch: list[BatchInfo] = [
             (bg, _on_host(spec), chunk_sel, out_sel, is_complete)
             for bg, spec, chunk_sel, out_sel, is_complete in batch
         ]
-        results = await self._host_pipeline(batch[0][1]).read(host_batch, host, drop_axes)
-        out_arr[...] = cp.asarray(host.as_ndarray_like())
+        results = await pipeline.read(host_batch, host, drop_axes)
+        with out_arr.device:  # (this thread's current device may be another one)
+            out_arr[...] = cp.asarray(host.as_ndarray_like().astype(out_arr.dtype, copy=False))
         return results
 
 
@@ -301,10 +343,11 @@ _DEFAULT_DECODERS = 1
 # `indptr` takes.
 _MIN_BYTES_ENV = "ZARR_KVIKIO_MIN_BYTES"
 _DEFAULT_MIN_BYTES = 1 << 20
-# How contiguous reads of sharded 1-D arrays (e.g. a sparse matrix's data and indices) fetch the
-# stored bytes: "host" reads them into pinned host memory and copies them to the GPU at once, which
-# is fastest when the data comes from the page cache or GPUDirect Storage runs in compatibility
-# mode; "kvikio" reads them straight into GPU memory with KvikIO (for GPUDirect Storage).
+# How contiguous reads of zstd-compressed sharded 1-D arrays (e.g. a sparse matrix's data and
+# indices) fetch the stored bytes: "host" reads them into pinned host memory and copies them to
+# the GPU, which is fastest when the data comes from the page cache or GPUDirect Storage runs in
+# compatibility mode; "kvikio" reads them straight into GPU memory with KvikIO (for GPUDirect
+# Storage).
 _FETCH_ENV = "ZARR_KVIKIO_FETCH"
 _DEFAULT_FETCH = "host"
 # Threads for host reads. Reads of at least `_PARALLEL_READ_BYTES` on average are spread over them;
@@ -312,52 +355,161 @@ _DEFAULT_FETCH = "host"
 _READ_THREADS_ENV = "ZARR_KVIKIO_READ_THREADS"
 _DEFAULT_READ_THREADS = 16
 _PARALLEL_READ_BYTES = 256 << 10
+# Host fetches are staged in pinned host memory, in buffers kept for later fetches. A fetch takes
+# one that fits, else one grown (in steps of `_STAGING_STEP_BYTES`) as far as all buffers together
+# stay within `_STAGING_LIMIT_BYTES` (freeing kept ones if no other fetch runs, it holds less than
+# half the fetch, and that lets it grow; one that holds half only grows to fit);
+# fetches larger than their buffer go through it in slabs, one half read into while the other one
+# is copied to the GPU (in parts of at most `_READ_PART_BYTES`, spread over the read threads).
+# Slabs are slower when reading is faster than the copy (e.g. from the page cache): a fetch staged
+# at once is copied while the decode is prepared.
+_STAGING_STEP_BYTES = 64 << 20
+_STAGING_LIMIT_BYTES = 4 << 30
+_READ_PART_BYTES = 4 << 20
+# The files reads keep open are limited, in file descriptors, to half the soft limit of open files
+# per process (often 1024), shared by all threads (`_open_files`). A KvikIO file handle takes up to
+# two; a contiguous read keeps every shard open, plus a KvikIO handle with ZARR_KVIKIO_FETCH=kvikio.
+_CUFILE_FDS = 2
+_CONTIGUOUS_FDS = {"host": 1, "kvikio": 1 + _CUFILE_FDS}
+# Files a read opens at once, at most
+_MAX_OPEN_FILES = 256
 
-_pools: dict[int, queue.Queue[tuple[Any, Any]]] = {}
+# (None, after `release_memory` dropped a pool: tells threads waiting on it to use the new one)
+_pools: dict[int, queue.Queue[tuple[Any, Any] | None]] = {}
 _pools_lock = threading.Lock()
 # nvCOMP allocates and frees pinned host memory in every decode call, and freeing it
 # (`cudaFreeHost`) synchronises the whole device, serialising concurrent reads: it gets the
 # pinned memory from this pool instead.
 _pinned_pool: list[Any] = []
-# pinned host buffers that host reads are staged in, per thread
-_staging: dict[int, Any] = {}
+# pinned host buffers for host fetches that no fetch uses now, each with the event after its last
+# copy (if any), and the bytes of all buffers (also those in use)
+_staging: list[tuple[np.ndarray, Any]] = []
+_staging_bytes = 0
 _staging_lock = threading.Lock()
 
 
 def release_memory() -> None:
     """Release the scratch space held by the cached nvCOMP codecs and the pinned read buffers."""
-    with _staging_lock:
-        _staging.clear()
-    if _pinned_pool:
-        _pinned_pool[0].free_all_blocks()
-    with _pools_lock:
-        for device_id in list(_pools):
-            pool = _pools.pop(device_id)
-            for _ in range(pool.maxsize):
-                codec, stream = pool.get()  # waits for codecs that are in use
-                stream.synchronize()
-                # the codec must go before the stream it runs on
-                # (a tuple would release its items the other way round)
-                del codec
-                del stream
+    global _staging_bytes
+    try:
+        with _staging_lock:
+            for buf, copied in _staging:
+                if copied is not None:
+                    copied.synchronize()
+                _staging_bytes -= buf.nbytes
+            _staging.clear()
+    finally:
+        with _pools_lock:
+            try:
+                for device_id in list(_pools):
+                    pool = _pools.pop(device_id)
+                    for _ in range(pool.maxsize):
+                        # (waits for codecs in use)
+                        codec, stream = cast("tuple[Any, Any]", pool.get())
+                        stream.synchronize()
+                        # the codec must go before the stream it runs on
+                        # (a tuple would release its items the other way round)
+                        del codec
+                        del stream
+                    # threads that got this pool but not yet a codec from it move on to the new one
+                    pool.put(None)
+            finally:
+                # A Python allocator still set at exit crashes the process, so it is reset also
+                # when a synchronize above failed (e.g. after a CUDA error). Otherwise no decode
+                # runs now (new ones wait for the lock), and `_pool` sets it again.
+                if _pinned_pool:
+                    import nvidia.nvcomp as nv
+
+                    nv.set_pinned_allocator(None)
+                    _pinned_pool.pop().free_all_blocks()
 
 
 # also at exit, so interpreter teardown does not release them in the wrong order
 atexit.register(release_memory)
 
 
-def _pool(device_id: int) -> queue.Queue[tuple[Any, Any]]:
+def _env_int(name: str, default: int, minimum: int | None = None) -> int:
+    """The integer setting in environment variable `name`."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        n = int(value)
+    except ValueError:
+        msg = f"{name} must be an integer, got {value!r}"
+        raise ValueError(msg) from None
+    if minimum is not None and n < minimum:
+        msg = f"{name} must be at least {minimum}, got {n}"
+        raise ValueError(msg)
+    return n
+
+
+class _FileBudget:
+    """File descriptors that reads may keep open at once, shared by all threads."""
+
+    def __init__(self, total: int | None = None) -> None:
+        self._total = total  # (None: half the soft limit of open files, read when first needed)
+        self._used = 0
+        self._freed = threading.Condition()
+        # reservations waiting, served in order: else small ones could keep a large one waiting
+        self._queue: deque[object] = deque()
+
+    @property
+    def total(self) -> int:
+        if self._total is None:
+            import resource
+
+            soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+            self._total = sys.maxsize if soft == resource.RLIM_INFINITY else max(soft // 2, 1)
+        return self._total
+
+    def files(self, fds_per_file: int) -> int:
+        """How many files of `fds_per_file` file descriptors a read may open at once."""
+        return max(1, min(_MAX_OPEN_FILES, self.total // fds_per_file))
+
+    @contextmanager
+    def reserve(self, fds: int) -> Iterator[None]:
+        """Take `fds` file descriptors for the block, waiting until they are free.
+
+        All are taken at once, and none is held while waiting, so reads can't deadlock.
+        Reservations are served first come, first served.
+        """
+        fds = min(fds, self.total)  # (or a file taking more than all would wait forever)
+        ticket = object()
+        with self._freed:
+            self._queue.append(ticket)
+            try:
+                self._freed.wait_for(
+                    lambda: self._queue[0] is ticket and self._used + fds <= self.total
+                )
+                self._used += fds
+            finally:
+                self._queue.remove(ticket)
+                self._freed.notify_all()  # (the next one may fit too)
+        try:
+            yield
+        finally:
+            with self._freed:
+                self._used -= fds
+                self._freed.notify_all()
+
+
+_open_files = _FileBudget()
+
+
+def _pool(device_id: int) -> queue.Queue[tuple[Any, Any] | None]:
     """The pool of nvCOMP zstd codecs for a device, each with the CUDA stream it runs on."""
     import cupy as cp
     import nvidia.nvcomp as nv
 
     with _pools_lock:
         if device_id not in _pools:
+            # (with no codecs, decodes would wait for one forever)
+            n = _env_int(_DECODERS_ENV, _DEFAULT_DECODERS, minimum=1)
             if not _pinned_pool:
                 _pinned_pool.append(cp.cuda.PinnedMemoryPool())
                 nv.set_pinned_allocator(lambda nbytes, *_: _pinned_pool[0].malloc(nbytes))
-            n = int(os.environ.get(_DECODERS_ENV, _DEFAULT_DECODERS))
-            pool: queue.Queue[tuple[Any, Any]] = queue.Queue(maxsize=n)
+            pool: queue.Queue[tuple[Any, Any] | None] = queue.Queue(maxsize=n)
             for _ in range(n):
                 stream = cp.cuda.Stream(non_blocking=True)
                 codec = nv.Codec(
@@ -372,17 +524,21 @@ def _pool(device_id: int) -> queue.Queue[tuple[Any, Any]]:
 
 
 def _stream(device_id: int) -> Any:
-    """A per-thread, per-device CUDA stream."""
+    """A per-thread, per-device CUDA stream, after the work queued on the default stream so far."""
     import cupy as cp
 
     streams: dict[int, Any] = _thread_local.__dict__.setdefault("streams", {})
     if device_id not in streams:
         streams[device_id] = cp.cuda.Stream(non_blocking=True)
-    return streams[device_id]
+    stream = streams[device_id]
+    # zarr allocates the output from CuPy's pool for the default stream, so work queued there
+    # (on an array freed since) may still use its memory
+    stream.wait_event(cp.cuda.Stream.null.record())
+    return stream
 
 
 def _max_decode_bytes() -> int:
-    return int(os.environ.get(_MAX_DECODE_BYTES_ENV, _DEFAULT_MAX_DECODE_BYTES))
+    return _env_int(_MAX_DECODE_BYTES_ENV, _DEFAULT_MAX_DECODE_BYTES)
 
 
 def _decode(pieces: list[_Piece], stream: Any, device: Any) -> None:
@@ -411,19 +567,25 @@ def _decode_into(
         size += n
     groups.append((start, len(sizes)))
     pool = _pool(device.id)
-    codec, codec_stream = pool.get()
+    while (item := pool.get()) is None:  # the pool was released: pass that on, use the new one
+        pool.put(None)
+        pool = _pool(device.id)
+    codec, codec_stream = item
     try:
         # the codec's stream waits for the reads/allocations queued on ours, and vice versa
         codec_stream.wait_event(stream.record())
         for a, b in groups:
             codec.decode(nv.as_arrays(src[a:b]), out=nv.as_arrays(dst[a:b]))
-        done = codec_stream.record()
     finally:
-        # work queued later on the codec's stream runs after ours, so it can be reused right away
-        pool.put((codec, codec_stream))
-    stream.wait_event(done)
-    # the compressed buffers must stay alive until the decode has consumed them
-    done.synchronize()
+        try:
+            done = codec_stream.record()
+        finally:
+            # work queued later on the codec's stream runs after ours, so it can be reused right
+            # away (and it must go back also if CUDA failed, or later decodes wait for it forever)
+            pool.put((codec, codec_stream))
+        stream.wait_event(done)
+        # the buffers must stay alive until the decodes queued so far are done (also on errors)
+        done.synchronize()
 
 
 @dataclass(slots=True)
@@ -512,7 +674,13 @@ def _read_host(
         else:
             p.target[...] = p.data
     results = tuple(_scatter(e, host, drop_axes) for e in entries)
-    out.set(host)
+    if out.flags.c_contiguous or out.flags.f_contiguous:
+        out.set(host)
+    else:  # (which `set` can't copy into)
+        import cupy as cp
+
+        with out.device:
+            out[...] = cp.asarray(host)
     return results
 
 
@@ -574,40 +742,43 @@ def _read_gpu_contiguous(
     assert layout.inner_chunk_shape is not None
     (n,) = layout.inner_chunk_shape
     chunk_bytes = n * out.itemsize
+    fetch = _fetch_mode()
     fds: dict[Path, int] = {}
-    try:
-        plan = _plan_contiguous(layout, batch, paths, out, fds)
-        if plan is None:
-            return None
-        if plan.files.size == 0:
-            return tuple(GetResult(status="present") for _ in batch)
-        with out.device as device:
-            stream = _stream(device.id)
-            with stream:
-                temp = cp.empty(max(len(plan.copies), 1) * n, out.dtype)
-                targets = np.where(
-                    plan.targets >= 0,
-                    plan.targets,
-                    temp.data.ptr + (-1 - plan.targets) * chunk_bytes,
-                )
-                # `staged` (pinned host memory, if any) must outlive the asynchronous copy
-                stored, positions, staged = _fetch_contiguous(plan, list(fds.values()), stream)
-                src_ptrs = (stored.data.ptr + positions).tolist()
-                _decode_into(
-                    [_DevicePtr(p, s) for p, s in zip(src_ptrs, plan.sizes.tolist(), strict=True)],
-                    [_DevicePtr(int(t), chunk_bytes) for t in targets.tolist()],
-                    [chunk_bytes] * len(src_ptrs),
-                    stream,
-                    device,
-                )
-                for k, (a, b, out_a, out_b) in enumerate(plan.copies):
-                    out[out_a:out_b] = temp[k * n + a : k * n + b]
-                stream.synchronize()
-                del staged
-        return tuple(GetResult(status="present") for _ in batch)
-    finally:
-        for fd in fds.values():
-            os.close(fd)
+    # the shard files are open (and counted) only until their stored bytes are fetched
+    # (closed before `_read_gpu` reads instead, if it has to)
+    with _open_files.reserve(_CONTIGUOUS_FDS[fetch] * len(batch)):
+        try:
+            plan = _plan_contiguous(layout, batch, paths, out, fds)
+            if plan is None:
+                return None
+            if plan.files.size == 0:
+                return tuple(GetResult(status="present") for _ in batch)
+            with out.device as device:
+                stream = _stream(device.id)
+                with stream:
+                    stored, positions = _fetch_contiguous(plan, list(fds.values()), stream, fetch)
+        finally:
+            for fd in fds.values():
+                os.close(fd)
+    with out.device, stream:
+        temp = cp.empty(max(len(plan.copies), 1) * n, out.dtype)
+        targets = np.where(
+            plan.targets >= 0,
+            plan.targets,
+            temp.data.ptr + (-1 - plan.targets) * chunk_bytes,
+        )
+        src_ptrs = (stored.data.ptr + positions).tolist()
+        _decode_into(
+            [_DevicePtr(p, s) for p, s in zip(src_ptrs, plan.sizes.tolist(), strict=True)],
+            [_DevicePtr(int(t), chunk_bytes) for t in targets.tolist()],
+            [chunk_bytes] * len(src_ptrs),
+            stream,
+            device,
+        )
+        for k, (a, b, out_a, out_b) in enumerate(plan.copies):
+            out[out_a:out_b] = temp[k * n + a : k * n + b]
+        stream.synchronize()
+    return tuple(GetResult(status="present") for _ in batch)
 
 
 @dataclass(slots=True)
@@ -691,8 +862,8 @@ def _plan_contiguous(
 
 
 def _fetch_contiguous(
-    plan: _ContiguousPlan, fds: list[int], stream: Any
-) -> tuple[Any, np.ndarray, np.ndarray | None]:
+    plan: _ContiguousPlan, fds: list[int], stream: Any, fetch: str
+) -> tuple[Any, np.ndarray]:
     """The stored bytes of all planned chunks in one device buffer, and each chunk's position in it.
 
     Chunks that are stored next to each other are read together.
@@ -722,76 +893,257 @@ def _fetch_contiguous(
         )
     )
     device_buf = cp.empty(total, cp.uint8)
-    if os.environ.get(_FETCH_ENV, _DEFAULT_FETCH) == "kvikio":
+    if fetch == "kvikio":
         _fetch_kvikio(reads, device_buf)
-        return device_buf, positions, None
-    host = _staging_buffer(total)
-    _fetch_host_reads(reads, host)
-    device_buf.set(host, stream=stream)
-    return device_buf, positions, host
+    else:
+        _fetch_staged(reads, device_buf, stream)
+    return device_buf, positions
 
 
-def _fetch_host_reads(reads: list[tuple[int, int, int, int]], host: np.ndarray) -> None:
+def _fetch_mode() -> str:
+    """How contiguous reads fetch the stored bytes (see `_FETCH_ENV`)."""
+    if (fetch := os.environ.get(_FETCH_ENV, _DEFAULT_FETCH)) not in _CONTIGUOUS_FDS:
+        msg = f"{_FETCH_ENV} must be 'host' or 'kvikio', got {fetch!r}"
+        raise ValueError(msg)
+    return fetch
+
+
+type _Read = tuple[int, int, int, int]  # (fd, offset in the file, bytes, position in the buffer)
+
+
+def _fetch_staged(reads: list[_Read], device_buf: Any, stream: Any) -> None:
+    """Read into `device_buf` (asynchronously copied on `stream`) through a pinned staging buffer.
+
+    All at once if it fits, else slab by slab: while one half of it is read into, the
+    asynchronous copy out of the other half runs.
+    """
+    total = len(device_buf)
+    staging = _take_staging(total)
+    half = len(staging) // 2
+    halves = staging[:half], staging[half:]
+    slabs = _slabs(reads, total, half) if total > len(staging) else []
+    copied: list[Any] = [None, None]  # the last copy out of each half
+    waits: list[Callable[..., None]] = []
+
+    def start(k: int) -> None:
+        a, b, parts = slabs[k]
+        waits.append(_fetch_host_reads(parts, halves[k % 2][: b - a], after=copied[k % 2]))
+
+    try:
+        if not slabs:
+            _fetch_host_reads(reads, staging[:total])()
+            device_buf.set(staging[:total], stream=stream)
+        else:
+            start(0)
+        for k, (a, b, _) in enumerate(slabs):
+            if k + 1 < len(slabs):
+                start(k + 1)  # (queued behind this slab's reads, so the read threads stay busy)
+            waits[k]()
+            device_buf[a:b].set(halves[k % 2][: b - a], stream=stream)
+            copied[k % 2] = stream.record()
+    except BaseException:
+        # no read may still use the buffer (or the files) when the next fetch does
+        # (reads not started yet are dropped)
+        for wait in waits:
+            with suppress(Exception):
+                wait(drop=True)
+        raise
+    finally:
+        _give_staging(staging, stream.record())  # (for after the copies queued so far)
+
+
+def _slabs(reads: list[_Read], total: int, size: int) -> list[tuple[int, int, list[_Read]]]:
+    """Split `reads` covering [0, total) into slabs: (start, stop, reads at positions in the slab).
+
+    The reads are split into parts of at most `_READ_PART_BYTES` too.
+    """
+    slabs: list[tuple[int, int, list[_Read]]] = [
+        (a, min(a + size, total), []) for a in range(0, total, size)
+    ]
+    for fd, offset, length, pos in reads:
+        while length:
+            n = min(length, _READ_PART_BYTES - pos % _READ_PART_BYTES, size - pos % size)
+            start, _, parts = slabs[pos // size]
+            parts.append((fd, offset, n, pos - start))
+            offset, length, pos = offset + n, length - n, pos + n
+    return slabs
+
+
+def _pread_into(fd: int, buf: memoryview, offset: int) -> None:
+    """Fill `buf` from `fd` at `offset` (a single read returns at most ~2 GiB on Linux)."""
+    while buf:
+        n = os.preadv(fd, [buf], offset)
+        if n == 0:
+            path = Path(f"/proc/self/fd/{fd}").resolve()
+            msg = f"{path}: unexpected end of file at offset {offset}"
+            raise OSError(msg)
+        buf, offset = buf[n:], offset + n
+
+
+def _fetch_host_reads(
+    reads: list[_Read], host: np.ndarray, after: Any = None
+) -> Callable[..., None]:
+    """Read `reads` into `host` once `after` (an event, if any) is done.
+
+    Returns a function that waits for the reads and raises the first error once every read is
+    done (`host` and the files are reused next). Large reads are queued now, spread over the read
+    threads; others run in that function (the work `after` stands for runs until then), or never
+    if it is called with ``drop=True``.
+    """
     view = memoryview(host)
 
-    def read(job: tuple[int, int, int, int]) -> None:
+    def read(job: _Read) -> OSError | None:
         fd, start, length, pos = job
-        if os.preadv(fd, [view[pos : pos + length]], start) != length:
-            msg = f"short read of {length} bytes at offset {start}"
-            raise OSError(msg)
+        try:
+            _pread_into(fd, view[pos : pos + length], start)
+        except OSError as e:
+            return e
+        return None
 
-    threads = int(os.environ.get(_READ_THREADS_ENV, _DEFAULT_READ_THREADS))
+    threads = _env_int(_READ_THREADS_ENV, _DEFAULT_READ_THREADS)
+    queued = None
     if threads > 1 and len(reads) > 1 and len(host) // len(reads) >= _PARALLEL_READ_BYTES:
-        list(_read_executor(threads).map(read, reads))
-    else:
-        for job in reads:
-            read(job)
+        if after is not None:
+            after.synchronize()
+        queued = _read_in_threads(threads, read, reads)
+
+    def wait(*, drop: bool = False) -> None:
+        if queued is None and drop:
+            return
+        if queued is None and after is not None:
+            after.synchronize()
+        for error in list(map(read, reads) if queued is None else queued):
+            if error is not None:
+                raise error
+
+    return wait
 
 
 def _fetch_kvikio(reads: list[tuple[int, int, int, int]], device_buf: Any) -> None:
     import kvikio
 
     handles: dict[int, Any] = {}
-    futures = []
+    pending: list[tuple[Any, int, int, Path]] = []
     try:
         for fd, start, length, pos in reads:
+            path = Path(f"/proc/self/fd/{fd}")
             if fd not in handles:
-                handles[fd] = kvikio.CuFile(f"/proc/self/fd/{fd}", "r")
-            futures.append(
-                handles[fd].pread(device_buf[pos : pos + length], length, file_offset=start)
-            )
-        for fut in futures:
-            fut.get()
+                handles[fd] = kvikio.CuFile(path, "r")
+            read = handles[fd].pread(device_buf[pos : pos + length], length, file_offset=start)
+            pending.append((read, length, start, path))
     finally:
+        _wait_reads(pending, handles)
+
+
+def _wait_reads(reads: list[tuple[Any, int, int, Path]], handles: dict[Any, Any]) -> None:
+    """Wait for the KvikIO `reads` (future, bytes, offset, file), then close and forget `handles`.
+
+    Every read is waited for, also after an error: none may outlive its file handle or buffer.
+    """
+    waited = 0
+    try:
+        for fut, nbytes, offset, path in reads:
+            waited += 1
+            # (GPUDirect Storage reads past the end of a file return fewer bytes without an error)
+            if (got := fut.get()) != nbytes:
+                msg = f"{path.resolve()}: read {got} of {nbytes} bytes at offset {offset}"
+                raise OSError(msg)
+    finally:
+        for fut, *_ in reads[waited:]:
+            with suppress(Exception):
+                fut.get()
+        reads.clear()
         for fh in handles.values():
             fh.close()
+        handles.clear()
 
 
 _executor: Any = None
+_executor_threads = 0
 _executor_lock = threading.Lock()
 
 
-def _read_executor(threads: int) -> Any:
-    global _executor
+def _read_in_threads(
+    threads: int, read: Callable[[_Read], OSError | None], reads: list[_Read]
+) -> Iterator[OSError | None]:
+    """``map(read, reads)`` in a pool of `threads` threads, queued now."""
+    global _executor, _executor_threads
     with _executor_lock:
-        if _executor is None or _executor._max_workers != threads:
+        if _executor_threads != threads:
             from concurrent.futures import ThreadPoolExecutor
 
+            if _executor is not None:
+                _executor.shutdown(wait=False)  # (its threads end once their reads are done)
             _executor = ThreadPoolExecutor(threads, thread_name_prefix="zarr-kvikio-read")
-        return _executor
+            _executor_threads = threads
+        # (queued with the lock held: an executor replaced by another thread takes no more reads)
+        return _executor.map(read, reads)
 
 
-def _staging_buffer(nbytes: int) -> np.ndarray:
-    """A pinned host buffer of `nbytes` bytes, reused by later reads of this thread."""
-    import cupyx
+def _take_staging(nbytes: int) -> np.ndarray:
+    """A pinned host buffer for a host fetch of `nbytes` bytes (smaller if the limit requires).
 
-    key = threading.get_ident()
+    The smallest kept one that fits, else the largest one, grown as far as the limit allows
+    (counting the other kept ones if no other fetch runs and it holds less than half the fetch,
+    which are then freed for it if needed, smallest first). One that holds half only grows to fit.
+    """
+    global _staging_bytes
+    step = _STAGING_STEP_BYTES
+    buf, copied = None, None
     with _staging_lock:
-        buf = _staging.get(key)
-        if buf is None or buf.nbytes < nbytes:
-            buf = cupyx.empty_pinned(max(nbytes, 64 << 20), np.uint8)
-            _staging[key] = buf
-    return buf[:nbytes]
+        _staging.sort(key=lambda kept: kept[0].nbytes)
+        if _staging:
+            fits = [i for i, (kept, _) in enumerate(_staging) if kept.nbytes >= nbytes]
+            buf, copied = _staging.pop(fits[0] if fits else -1)
+        held = 0 if buf is None else buf.nbytes
+        room = _STAGING_LIMIT_BYTES - _staging_bytes + held
+        # the other kept ones count as room too if no other fetch runs and the largest one holds
+        # less than half the fetch: else, once fetches running at once filled the limit, later
+        # ones would stream through it in many slabs (fetches running at once keep them, else
+        # they would end up with the smallest buffers; and up to four slabs, through one that
+        # holds half, cost less than pinning more, so that one only grows to fit)
+        idle = sum(kept.nbytes for kept, _ in _staging)
+        if _staging_bytes > held + idle or 2 * held >= nbytes:
+            idle = 0
+        # (in whole steps: the fetch rounded up, at most the room left, and at least one)
+        size = max(min(-(-nbytes // step), (room + idle) // step), 1) * step
+        if 2 * held >= nbytes and size < nbytes:
+            size = held
+        while held < size and room < size <= room + idle:  # (only as many as it takes)
+            kept, kept_copied = _staging.pop(0)
+            if kept_copied is not None:
+                kept_copied.synchronize()  # (no copy may still read the buffer that is freed)
+            _staging_bytes -= kept.nbytes
+            room, idle = room + kept.nbytes, idle - kept.nbytes
+            del kept, kept_copied
+        if held < size:
+            if copied is not None:
+                copied.synchronize()  # (no copy may still read the buffer that is freed)
+            _staging_bytes -= held
+            buf = copied = None  # (freed before the larger one is allocated)
+            buf = _empty_pinned(size)
+            _staging_bytes += size
+    if copied is not None:
+        copied.synchronize()  # (its last copy to the GPU)
+    assert buf is not None
+    return buf
+
+
+def _give_staging(buf: np.ndarray, copied: Any) -> None:
+    """Keep a buffer from `_take_staging` for later fetches, once `copied` (an event) is done."""
+    with _staging_lock:
+        _staging.append((buf, copied))
+
+
+def _empty_pinned(nbytes: int) -> np.ndarray:
+    """Pinned host memory of exactly `nbytes` bytes, freed once dropped.
+
+    (Not from CuPy's pinned memory pool, which rounds sizes up to powers of two and keeps them.)
+    """
+    import cupy as cp
+
+    mem = cp.cuda.PinnedMemoryPointer(cp.cuda.PinnedMemory(nbytes), 0)
+    return np.ndarray(nbytes, np.uint8, buffer=mem)
 
 
 def _scatter(entry: _Entry, out: Any, drop_axes: tuple[int, ...]) -> GetResult:
@@ -857,7 +1209,7 @@ def _plan(
     if direct is not None:
         _plan_direct(entry, path, stored, stored_shape, out=out, direct=direct, pieces=pieces)
     else:
-        _plan_region(entry, path, stored, stored_shape, out=out, direct=None, pieces=pieces)
+        _plan_region(entry, path, stored, stored_shape, out=out, pieces=pieces)
     return entry
 
 
@@ -905,7 +1257,6 @@ def _plan_region(
     stored_shape: tuple[int, ...],
     *,
     out: Any,
-    direct: None,
     pieces: list[_Piece],
 ) -> None:
     xp = _array_module(out)
@@ -1031,7 +1382,8 @@ def _read_shard_index(
     n_bytes = 16 * prod(per_shard)
     size = n_bytes + (4 if layout.index_has_crc else 0)
     with path.open("rb") as f:
-        raw = os.pread(f.fileno(), size, file_size - size if layout.index_at_end else 0)
+        # (a file shorter than the index reads short, rather than at a negative offset)
+        raw = os.pread(f.fileno(), size, max(file_size - size, 0) if layout.index_at_end else 0)
     if len(raw) != size:
         msg = f"{path}: shard index is truncated"
         raise ValueError(msg)
@@ -1066,27 +1418,30 @@ def _fetch(pieces: list[_Piece]) -> None:
     import cupy as cp
     import kvikio
 
-    handles: dict[Path, Any] = {}
-    futures = []
-    try:
-        for path, start, stop, group in _byte_ranges(pieces):
-            if path not in handles:
-                handles[path] = kvikio.CuFile(path, "r")
-            buf = cp.empty(stop - start, cp.uint8)
-            futures.append(handles[path].pread(buf, stop - start, file_offset=start))
-            for p in group:
-                p.data = buf[p.offset - start : p.offset - start + p.nbytes]
-        for fut in futures:
-            fut.get()
-    finally:
-        for fh in handles.values():
-            fh.close()
+    # (all ranges of a file in a row)
+    files = [list(ranges) for _, ranges in groupby(_byte_ranges(pieces), key=lambda r: r[0])]
+    for some_files in batched(files, _open_files.files(_CUFILE_FDS)):
+        handles: dict[Path, Any] = {}
+        reads: list[tuple[Any, int, int, Path]] = []
+        with _open_files.reserve(_CUFILE_FDS * len(some_files)):
+            try:
+                for path, start, stop, group in chain.from_iterable(some_files):
+                    if path not in handles:
+                        handles[path] = kvikio.CuFile(path, "r")
+                    buf = cp.empty(stop - start, cp.uint8)
+                    read = handles[path].pread(buf, stop - start, file_offset=start)
+                    reads.append((read, stop - start, start, path))
+                    for p in group:
+                        p.data = buf[p.offset - start : p.offset - start + p.nbytes]
+            finally:
+                _wait_reads(reads, handles)
 
 
 def _fetch_host(pieces: list[_Piece]) -> None:
     """Read all pieces into host memory, one read per contiguous byte range."""
     for path, start, stop, group in _byte_ranges(pieces):
+        buf = np.empty(stop - start, dtype=np.uint8)
         with path.open("rb") as fh:
-            buf = np.frombuffer(os.pread(fh.fileno(), stop - start, start), dtype=np.uint8)
+            _pread_into(fh.fileno(), memoryview(buf), start)
         for p in group:
             p.data = buf[p.offset - start : p.offset - start + p.nbytes]

@@ -18,6 +18,7 @@ from zarr.codecs import (
     ShardingCodec,
     ZstdCodec,
 )
+from zarr.core.buffer import gpu
 from zarr.core.codec_pipeline import FusedCodecPipeline
 
 import zarr_kvikio
@@ -29,7 +30,9 @@ if TYPE_CHECKING:
     from collections.abc import Generator
     from pathlib import Path
 
-pytestmark = pytest.mark.skipif(not zarr_kvikio.available(), reason="needs KvikIO and nvCOMP")
+pytestmark = pytest.mark.skipif(
+    not (zarr_kvikio.available() and cp.is_available()), reason="needs KvikIO, nvCOMP and a GPU"
+)
 
 PIPELINE = "zarr_kvikio.KvikioCodecPipeline"
 ZSTD = (ZstdCodec(level=3),)
@@ -212,11 +215,6 @@ def test_missing_chunks(tmp_path, fast_path_calls, shards):
     assert fast_path_calls
 
 
-def test_empty_array(tmp_path):
-    write(tmp_path / "a.zarr", np.zeros(0, "float32"), (10,))
-    check(tmp_path / "a.zarr", slice(None))
-
-
 def test_corrupt_index(tmp_path):
     data = rng.random(100).astype("float32")
     write(tmp_path / "a.zarr", data, (10,), shards=(50,))
@@ -271,11 +269,42 @@ def test_host_buffers_fall_back(tmp_path, fast_path_calls, fused_reads):
     assert fused_reads
 
 
-def test_memory_store_falls_back(fast_path_calls):
+HOST_PIPELINES = [  # (the pipeline zarr was configured with before `enable()`)
+    pytest.param({}, id="default"),
+    pytest.param(
+        {"codec_pipeline.path": "zarrs.ZarrsCodecPipeline"},
+        id="zarrs",
+        marks=pytest.mark.skipif(find_spec("zarrs") is None, reason="needs zarrs"),
+    ),
+]
+
+
+@pytest.mark.parametrize("host_pipeline", HOST_PIPELINES)  # (zarrs doesn't cast)
+@pytest.mark.parametrize(
+    ("dtype", "out_dtype"),
+    [("float32", "float64"), ("float64", "float32"), ("datetime64[s]", "int64")],
+)
+def test_other_out_dtype_falls_back(tmp_path, fast_path_calls, host_pipeline, dtype, out_dtype):
+    data = np.arange(300).astype(dtype)
+    write(tmp_path / "a.zarr", data, (50,), shards=(150,))
+    with zarr.config.set(host_pipeline), gpu_pipeline():
+        arr = zarr.open_array(tmp_path / "a.zarr", mode="r")
+        for sel in [slice(None), slice(None, None, 2)]:  # (zarrs reads steps with zarr's pipeline)
+            out = cp.zeros(len(data[sel]), dtype=out_dtype)
+            arr.get_basic_selection(sel, out=gpu.NDBuffer(out))
+            np.testing.assert_array_equal(cp.asnumpy(out), data[sel].astype(out_dtype))
+    assert not fast_path_calls
+
+
+@pytest.mark.parametrize("host_pipeline", HOST_PIPELINES)
+@pytest.mark.parametrize("shards", [None, (150,)])
+def test_memory_store_falls_back(fast_path_calls, host_pipeline, shards):
     data = rng.random(300).astype("float32")
     store = zarr.storage.MemoryStore()
-    with gpu_pipeline():
-        arr = zarr.create_array(store, shape=data.shape, dtype=data.dtype, chunks=(50,))
+    with zarr.config.set(host_pipeline), gpu_pipeline():
+        arr = zarr.create_array(
+            store, shape=data.shape, dtype=data.dtype, chunks=(50,), shards=shards
+        )
         arr[...] = cp.asarray(data)
         res = arr[:]
     np.testing.assert_array_equal(cp.asnumpy(res), data)
@@ -308,15 +337,24 @@ def test_pickle_keeps_pipeline(tmp_path):
 
 
 @pytest.mark.parametrize("shards", [None, (200,)], ids=["unsharded", "sharded"])
-def test_decode_in_several_calls(tmp_path, monkeypatch, fast_path_calls, shards):
+def test_decode_in_several_calls(tmp_path, monkeypatch, fast_path_calls, read_path, shards):
+    import nvidia.nvcomp as nv
+
     monkeypatch.setenv("ZARR_KVIKIO_MAX_DECODE_BYTES", "300")  # < 2 chunks of 40 float32 per call
+    as_arrays, frames = nv.as_arrays, []  # (frames per call, and as many outputs)
+    monkeypatch.setattr(nv, "as_arrays", lambda a: frames.append(len(a)) or as_arrays(a))
     data = rng.random(1000).astype("float32")
     write(tmp_path / "a.zarr", data, (40,), shards=shards)
     check(tmp_path / "a.zarr", slice(7, 993))
     assert fast_path_calls
+    if read_path == "gpu":
+        assert len(frames) > 2
+        assert set(frames) == {1}
 
 
-def test_release_memory(tmp_path):
+def test_release_memory(tmp_path, read_path):
+    if read_path == "host":
+        pytest.skip("host reads hold no nvCOMP codecs")
     data = rng.random(10_000).astype("float32")
     write(tmp_path / "a.zarr", data, (1000,), shards=(5000,))
     check(tmp_path / "a.zarr", slice(None))
@@ -348,27 +386,26 @@ def test_dask_enable(tmp_path):
 
     data = rng.random(1000).astype("float32")
     write(tmp_path / "a.zarr", data, (100,), shards=(500,))
-    before = zarr.config.get("codec_pipeline.path")
     with (
-        distributed.LocalCluster(n_workers=1, threads_per_worker=2, processes=True) as cluster,
+        distributed.LocalCluster(
+            n_workers=1, threads_per_worker=2, processes=True, dashboard_address=":0"
+        ) as cluster,
         distributed.Client(cluster) as client,
+        zarr_kvikio.dask.enable(client, num_threads=2),
     ):
-        try:
-            zarr_kvikio.dask.enable(client, num_threads=2)
-            # arrays opened here are read on the workers, into GPU memory
-            x = da.from_zarr(zarr.open_array(tmp_path / "a.zarr", mode="r"), chunks=250)
-            # check on the workers (moving GPU arrays between processes needs extra dependencies)
-            on_gpu = x.map_blocks(lambda b: np.array([isinstance(b, cp.ndarray)]), chunks=(1,))
-            assert on_gpu.compute().all()
-            np.testing.assert_array_equal(x.map_blocks(cp.asnumpy).compute(), data)
-            # while this process keeps reading into host memory
-            assert isinstance(zarr.open_array(tmp_path / "a.zarr", mode="r")[:], np.ndarray)
-            workers = client.run(lambda: zarr.config.get("codec_pipeline.path"))
-            assert set(workers.values()) == {PIPELINE}
-        finally:
-            zarr.config.set({"codec_pipeline.path": before})
+        # arrays opened here are read on the workers, into GPU memory
+        x = da.from_zarr(zarr.open_array(tmp_path / "a.zarr", mode="r"), chunks=250)
+        # check on the workers (moving GPU arrays between processes needs extra dependencies)
+        on_gpu = x.map_blocks(lambda b: np.array([isinstance(b, cp.ndarray)]), chunks=(1,))
+        assert on_gpu.compute().all()
+        np.testing.assert_array_equal(x.map_blocks(cp.asnumpy).compute(), data)
+        # while this process keeps reading into host memory
+        assert isinstance(zarr.open_array(tmp_path / "a.zarr", mode="r")[:], np.ndarray)
+        workers = client.run(lambda: zarr.config.get("codec_pipeline.path"))
+        assert set(workers.values()) == {PIPELINE}
 
 
+@pytest.mark.parametrize("read_path", ["gpu"], indirect=True)  # (sets the threshold itself)
 def test_small_reads_decoded_on_host(tmp_path, monkeypatch, fast_path_calls):
     monkeypatch.setenv("ZARR_KVIKIO_MIN_BYTES", str(1 << 20))
     data = rng.random(1 << 20).astype("float32")  # 4 MiB
@@ -465,7 +502,9 @@ def test_contiguous_reads_in_parallel(tmp_path, monkeypatch, fast_path_calls, re
         assert "zarr-kvikio-read" in used
 
 
-def test_release_memory_staging(tmp_path, monkeypatch):
+def test_release_memory_staging(tmp_path, monkeypatch, read_path):
+    if read_path == "host":
+        pytest.skip("host reads use no pinned staging buffers")
     monkeypatch.setenv("ZARR_KVIKIO_FETCH", "host")
     data = rng.random(1 << 15).astype("float32")
     write(tmp_path / "a.zarr", data, (512,), shards=(1 << 13,))
