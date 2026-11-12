@@ -10,9 +10,9 @@
 
 A [zarr-python](https://github.com/zarr-developers/zarr-python) codec pipeline that reads chunks from a local file system
 straight into GPU memory with [KvikIO](https://github.com/rapidsai/kvikio) and decodes them with [nvCOMP](https://developer.nvidia.com/nvcomp).
-Reads it can't do on the GPU fall back to zarr's own pipelines, so any array can be read.
+Reads it can’t do on the GPU fall back to zarr’s own pipelines, so any array can be read.
 
-Status: beta. Made for [rapids-singlecell](https://rapids-singlecell.scverse.org/)'s upcoming out-of-core reading
+Status: beta. Made for [rapids-singlecell](https://rapids-singlecell.scverse.org/)’s upcoming out-of-core reading
 (`rapids_singlecell.io`).
 
 ## Installation
@@ -26,7 +26,7 @@ it can then check and convert stores, and `zarr_kvikio.enable()` explains what i
 
 ## Usage
 
-Like [zarrs](https://github.com/zarrs/zarrs-python), zarr-kvikio is used through zarr's config: once it's installed,
+Like [zarrs](https://github.com/zarrs/zarrs-python), zarr-kvikio is used through zarr’s config: once it’s installed,
 zarr finds the pipeline by name, so any package can switch to it without importing zarr-kvikio:
 
 ```python
@@ -49,7 +49,7 @@ with zarr_kvikio.enable():  # or without `with`, to leave it on
 ```
 
 With Dask, one call switches the whole cluster: the workers read into GPU memory,
-while the client keeps reading into host memory (e.g. AnnData's `obs` and `var`):
+while the client keeps reading into host memory (e.g. AnnData’s `obs` and `var`):
 
 ```python
 import zarr_kvikio.dask
@@ -61,34 +61,34 @@ X = anndata.experimental.read_elem_lazy(zarr.open_group("data.zarr")["X"])
 ```
 
 Only the workers need KvikIO and nvCOMP: if one lacks them, `dask.enable()` raises and undoes itself. The workers get
-this process's `kvikio.*` settings (see [Configuration](#configuration)) as they are when it is called. In-process
-workers (`Client(processes=False)`, `LocalCluster(processes=False)`) share zarr's settings with the client, which then
+this process’s `kvikio.*` settings (see [Configuration](#configuration)) as they are when it is called. In-process
+workers (`Client(processes=False)`, `LocalCluster(processes=False)`) share zarr’s settings with the client, which then
 reads into GPU memory too, until the call is undone (also after the cluster closes). Repeated `dask.enable()` calls can
 be undone in any order.
 Workers started some other way (e.g. `dask cuda worker`) can be set up through the environment zarr is imported in
 instead, while the client selects the pipeline in its config:
-`ZARR_CODEC_PIPELINE__PATH=zarr_kvikio.KvikioCodecPipeline` (for arrays opened on the workers, e.g. a sparse matrix's
+`ZARR_CODEC_PIPELINE__PATH=zarr_kvikio.KvikioCodecPipeline` (for arrays opened on the workers, e.g. a sparse matrix’s
 indices), `ZARR_BUFFER=zarr.buffer.gpu.Buffer`, `ZARR_NDBUFFER=zarr.buffer.gpu.NDBuffer`, and any `ZARR_KVIKIO__*`
 settings.
 
 ## API
 
-| | |
-|---|---|
-| `enable()` | Select the pipeline and GPU buffers in zarr's config, in this process (also as a context manager). |
-| `dask.enable(client)` | The same on every worker of a Dask cluster, including workers started later. |
-| `available()`, `require()` | Whether KvikIO and nvCOMP are installed; raise with install instructions if not. |
-| `check()` | KvikIO, nvCOMP, zarr and CuPy versions, and whether GPUDirect Storage is active (from `gdscheck` and KvikIO's compatibility mode). |
-| `describe(array)` | An array's layout and what keeps it from being read fast on the GPU (including a store other than `LocalStore`). |
-| `convert_array(src, dst, name)` | Stream a 1-D or 2-D array into the layout below, shard by shard, and verify the copy. |
-| `layout(shape, itemsize)` | The chunk and shard shape `convert_array` uses. |
-| `cpu_pipeline()` | Open (source) arrays with host buffers and a fast CPU pipeline (zarrs if installed). |
-| `release_memory()` | Free the GPU scratch space held by the cached nvCOMP codecs and the pinned host read buffers. |
-| `KvikioCodecPipeline` | The codec pipeline, registered with zarr as `"zarr_kvikio.KvikioCodecPipeline"`. |
+  |                                 |                                                                                                                                    |
+  | ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+  | `enable()`                      | Select the pipeline and GPU buffers in zarr’s config, in this process (also as a context manager).                                 |
+  | `dask.enable(client)`           | The same on every worker of a Dask cluster, including workers started later.                                                       |
+  | `available()`, `require()`      | Whether KvikIO and nvCOMP are installed; raise with install instructions if not.                                                   |
+  | `check()`                       | KvikIO, nvCOMP, zarr and CuPy versions, and whether GPUDirect Storage is active (from `gdscheck` and KvikIO’s compatibility mode). |
+  | `describe(array)`               | An array’s layout and what keeps it from being read fast on the GPU (including a store other than `LocalStore`).                   |
+  | `convert_array(src, dst, name)` | Stream a 1-D or 2-D array into the layout below, shard by shard, and verify the copy.                                              |
+  | `layout(shape, itemsize)`       | The chunk and shard shape `convert_array` uses.                                                                                    |
+  | `cpu_pipeline()`                | Open (source) arrays with host buffers and a fast CPU pipeline (zarrs if installed).                                               |
+  | `release_memory()`              | Free the GPU scratch space held by the cached nvCOMP codecs and the pinned host read buffers.                                      |
+  | `KvikioCodecPipeline`           | The codec pipeline, registered with zarr as `"zarr_kvikio.KvikioCodecPipeline"`.                                                   |
 
 ## Configuration
 
-Like zarrs' options, zarr-kvikio's are keys of zarr's config, in its `kvikio` section:
+Like zarrs’ options, zarr-kvikio’s are keys of zarr’s config, in its `kvikio` section:
 
 ```python
 zarr.config.set({"kvikio.host_pipeline": "zarrs.ZarrsCodecPipeline", "kvikio.num_threads": 16})
@@ -136,8 +136,8 @@ The files that reads keep open while they fetch the stored bytes use at most hal
 wait for free file descriptors (first come, first served) instead of failing. Files opened only briefly, e.g. to read
 shard indices or for reads decoded on the CPU, are not counted.
 
-If KvikIO isn't using GPUDirect Storage (`zarr_kvikio.check()`, or `gdscheck -p`), it reads through the page cache and
-a bounce buffer. That still works (and is fast for cached data), but isn't direct NVMe to GPU DMA. With the default
+If KvikIO isn’t using GPUDirect Storage (`zarr_kvikio.check()`, or `gdscheck -p`), it reads through the page cache and
+a bounce buffer. That still works (and is fast for cached data), but isn’t direct NVMe to GPU DMA. With the default
 `kvikio.fetch`, contiguous reads of zstd-compressed sharded 1-D arrays go through pinned host memory instead of KvikIO,
 so GPUDirect Storage applies to them only with `"kvikio"`.
 
@@ -157,9 +157,9 @@ A read takes the fast path, which reads the stored bytes with KvikIO (or into pi
 - its (inner) chunks are smaller than 2 GiB if zstd-compressed (nvCOMP's limit).
 
 Everything else, including reads into host buffers and writes of host buffers, is handled by `kvikio.host_pipeline`
-(e.g. zarrs), or else zarr's `FusedCodecPipeline`. Reads into GPU buffers of arrays the GPU can't decode (e.g. blosc,
-or structured data types), or into GPU buffers of another data type than the array's, are decoded on the CPU and then
-copied. Writes of GPU buffers (every write while `enable()` is active) go through zarr's `BatchedCodecPipeline`.
+(e.g. zarrs), or else zarr’s `FusedCodecPipeline`. Reads into GPU buffers of arrays the GPU can’t decode (e.g. blosc,
+or structured data types), or into GPU buffers of another data type than the array’s, are decoded on the CPU and then
+copied. Writes of GPU buffers (every write while `enable()` is active) go through zarr’s `BatchedCodecPipeline`.
 
 How a fast read works:
 
@@ -178,25 +178,27 @@ How a fast read works:
   Measured on an RTX PRO 6000 (decode time, real float32 data):
 
   | frame size | 16 MiB read | 256 MiB read | 2 GiB read |
-  |---|---|---|---|
-  | 64 KiB | 3.4 ms | 22 ms | 213 ms |
-  | 256 KiB | 6.3 ms | 12 ms | 60 ms |
-  | 1 MiB | 22 ms | 27 ms | 42 ms |
+  | ---------- | ----------- | ------------ | ---------- |
+  | 64 KiB     | 3.4 ms      | 22 ms        | 213 ms     |
+  | 256 KiB    | 6.3 ms      | 12 ms        | 60 ms      |
+  | 1 MiB      | 22 ms       | 27 ms        | 42 ms      |
 
   This applies to *every* array a read touches, e.g. also the `indptr` of a sparse matrix.
+
 - **Shard** so that a read opens a few files instead of one per chunk: without sharding, small reads are dominated by per-file overhead.
+
 - **Store the chunks of every shard in order**, so a contiguous range is a single read. zarr's fused pipeline does;
   zarrs (faster at writing) stores them in whatever order they were compressed in.
 
 `convert_array` writes this layout (zstd, ~256 KiB chunks: whole rows of a 2-D array or row pieces, 512 chunks per
 shard, in order; optionally with a smaller dtype, e.g. uint16 indices), and `describe` reports what an existing array
-lacks. For whole AnnData stores, rapids-singlecell's upcoming `rapids_singlecell.io.convert_zarr` converts every matrix
+lacks. For whole AnnData stores, rapids-singlecell’s upcoming `rapids_singlecell.io.convert_zarr` converts every matrix
 this way and copies everything else.
 
 `convert_array` returns the new array, opened with the codec pipeline zarr is configured with (e.g. the GPU one after
-`enable()`). It runs one conversion at a time, because zarr's config is process-wide: while one runs, zarr reads in
-other threads return NumPy arrays, and arrays opened in other threads while it creates the new array keep zarr's fused
-pipeline. `cpu_pipeline()` sets zarr's config for the whole process too, so overlapping `cpu_pipeline()` blocks in
+`enable()`). It runs one conversion at a time, because zarr’s config is process-wide: while one runs, zarr reads in
+other threads return NumPy arrays, and arrays opened in other threads while it creates the new array keep zarr’s fused
+pipeline. `cpu_pipeline()` sets zarr’s config for the whole process too, so overlapping `cpu_pipeline()` blocks in
 several threads are not supported.
 
 ## Benchmark
@@ -206,15 +208,15 @@ read with `anndata.io.sparse_dataset(...)[start:stop]` in zarr GPU mode (`zarr.c
 RTX PRO 6000 Blackwell, data in the page cache, KvikIO in compat mode, `KVIKIO_NTHREADS=16`.
 Best of 5, see `benchmarks/bench_anndata.py`.
 
-| rows | nnz | zarr default pipeline (CPU decode) | zarr-kvikio | zarr-kvikio, 4 GiB decode limit |
-|---|---|---|---|---|
-| 20k | 73M | 0.134 s | **0.062 s** | 0.062 s |
-| 20k (offset 300k) | 33M | 0.071 s | **0.047 s** | 0.046 s |
-| 200k | 624M | 1.170 s | **0.303 s** | 0.227 s |
-| 500k | 1.1B | 2.109 s | **0.515 s** | 0.406 s |
+  | rows              | nnz  | zarr default pipeline (CPU decode) | zarr-kvikio | zarr-kvikio, 4 GiB decode limit |
+  | ----------------- | ---- | ---------------------------------- | ----------- | ------------------------------- |
+  | 20k               | 73M  | 0.134 s                            | **0.062 s** | 0.062 s                         |
+  | 20k (offset 300k) | 33M  | 0.071 s                            | **0.047 s** | 0.046 s                         |
+  | 200k              | 624M | 1.170 s                            | **0.303 s** | 0.227 s                         |
+  | 500k              | 1.1B | 2.109 s                            | **0.515 s** | 0.406 s                         |
 
 Store layout: zstd level 3, sharded with 1 MiB inner chunks and 128 inner chunks per shard
-(measured before the frame-size findings above). For comparison, zarr's default pipeline on the original layout
+(measured before the frame-size findings above). For comparison, zarr’s default pipeline on the original layout
 (blosc-lz4, int64 indices, one 609k-element chunk per file) took 0.10 s / 0.75 s / ~1.3 s for 20k / 200k / 500k rows.
 
 ## Limitations
@@ -230,10 +232,10 @@ Store layout: zstd level 3, sharded with 1 MiB inner chunks and 128 inner chunks
 
 The GPU tests pass on NVIDIA Blackwell GPUs (RTX PRO 6000) with these versions, each in at least one tested combination:
 
-| CUDA | KvikIO | nvCOMP | zarr-python | Python |
-|---|---|---|---|---|
-| 13 (`[cuda13]`) | 26.04, 26.06, 26.08, 26.10 | 5.2, 5.3, 6.0 | 3.3, 3.4 | 3.13, 3.14 |
-| 12.9 (`[cuda12]`) | 26.04, 26.10 | 5.2, 6.0 | 3.3, 3.4 | 3.13 |
+  | CUDA              | KvikIO                     | nvCOMP        | zarr-python | Python     |
+  | ----------------- | -------------------------- | ------------- | ----------- | ---------- |
+  | 13 (`[cuda13]`)   | 26.04, 26.06, 26.08, 26.10 | 5.2, 5.3, 6.0 | 3.3, 3.4    | 3.13, 3.14 |
+  | 12.9 (`[cuda12]`) | 26.04, 26.10               | 5.2, 6.0      | 3.3, 3.4    | 3.13       |
 
 The CPU tests (no GPU stack) also run on Python 3.12 in CI.
 
@@ -255,14 +257,14 @@ hatch run docs:build
 uv run --extra cuda13 --extra dask --group test pytest  # with the GPU tests (or --extra cuda12)
 ```
 
-The tests compare every read against zarr's default CPU pipeline. CI runs the CPU tests, the type check, the lint hooks
-and a build on GitHub's runners, and the GPU tests on a T4 through [cirun](https://cirun.io) (`test-gpu.yaml`): for
+The tests compare every read against zarr’s default CPU pipeline. CI runs the CPU tests, the type check, the lint hooks
+and a build on GitHub’s runners, and the GPU tests on a T4 through [cirun](https://cirun.io) (`test-gpu.yaml`): for
 pushes to `main`, weekly, and for pull requests labelled `run-gpu-ci` (or `skip-gpu-ci`; the label is removed after a
 run).
 
 To release, publish a GitHub release with a tag `vX.Y.Z`: the version comes from the tag
 (hatch-vcs), and `release.yaml` uploads it to PyPI through trusted publishing.
-Add the release's changes to its [release notes](https://github.com/scverse/zarr-kvikio/tree/main/docs/release-notes)
+Add the release’s changes to its [release notes](https://github.com/scverse/zarr-kvikio/tree/main/docs/release-notes)
 first (starting from `blank.md`, and listed in `index.md`), and replace `the-future` there with the release date.
 
 ## License
