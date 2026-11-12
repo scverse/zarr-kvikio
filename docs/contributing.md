@@ -12,7 +12,6 @@ the [scientific Python tutorials][], or the [scanpy developer guide][].
 [scanpy developer guide]: https://scanpy.scverse.org/page/dev/
 
 :::{tip} The *hatch* project manager
-
 We highly recommend to familiarize yourself with [`hatch`][hatch].
 Hatch is a Python project manager that
 
@@ -23,14 +22,13 @@ Hatch is a Python project manager that
 
 While the project is setup with `hatch` in mind,
 it is still possible to use different tools to manage dependencies, such as `uv` or `pip`.
-
 :::
 
 [hatch]: https://hatch.pypa.io/latest/
 
 ## Installing dev dependencies
 
-In addition to the packages needed to _use_ this package,
+In addition to the packages needed to *use* this package,
 you need additional python packages to [run tests](#writing-tests) and [build the documentation](#docs-building).
 
 :::::{tab-set}
@@ -52,9 +50,9 @@ If you are using VS code, install the [hatch-code][] extension.
 Additionally, make sure that the `vscode-python-environments` extension is installed (should be by default)
 and `"python.useEnvironmentsExtension": true` is activated in your `settings.json`.
 
-Next, open the "Python Environment Managers" sidebar.
+Next, open the “Python Environment Managers” sidebar.
 You can do so by opening the command palette (Ctrl+Shift+P) and searching for `Python: Focus on Environment Managers View`.
-It will show a collapsible list where you can expand "Hatch"
+It will show a collapsible list where you can expand “Hatch”
 and activate an environment by clicking on the checkmark next to it.
 As the main development environment, we recommend to use `hatch-test` with the latest supported Python version.
 
@@ -100,8 +98,6 @@ hatch env find hatch-test.py3.14-stable
 ```
 
 and manually point it to the python binary.
-
-
 ::::
 
 ::::{tab-item} uv
@@ -121,7 +117,6 @@ uv sync --extra cuda13 --extra dask --all-groups  # or --extra cuda12 (not both)
 ```
 
 The `.venv` directory is typically automatically discovered by IDEs such as VS Code.
-
 ::::
 
 ::::{tab-item} Pip
@@ -138,7 +133,6 @@ pip install -e ".[cuda13,dask]" --group dev --group test --group doc  # (pip >= 
 ```
 
 The `.venv` directory is typically automatically discovered by IDEs such as VS Code.
-
 ::::
 :::::
 
@@ -167,7 +161,7 @@ If you didn’t run the checks locally, the `Pre-commit checks` job of the GitHu
 pushes the automatic fixes back to your branch, and reports any remaining failures.
 We strongly encourage installing and running the checks locally first to understand their usage.
 
-Finally, most editors have an _autoformat on save_ feature.
+Finally, most editors have an *autoformat on save* feature.
 Consider enabling this option for [ruff][ruff-editors] and [biome][biome-editors].
 
 [prek]: https://prek.j178.dev/
@@ -196,7 +190,6 @@ hatch test  # test with the highest supported Python version
 # or
 hatch test --all  # test with all supported Python versions
 ```
-
 ::::
 
 ::::{tab-item} uv
@@ -205,7 +198,6 @@ hatch test --all  # test with all supported Python versions
 ```bash
 uv run pytest
 ```
-
 ::::
 
 ::::{tab-item} Pip
@@ -215,7 +207,6 @@ uv run pytest
 source .venv/bin/activate
 pytest
 ```
-
 ::::
 :::::
 
@@ -237,7 +228,7 @@ The CI job is defined in `.github/workflows/test.yaml`,
 however the single point of truth for CI jobs is the Hatch test matrix defined in `pyproject.toml`.
 This means that local testing via hatch and remote testing on CI tests against the same python versions and uses the same environments.
 
-GitHub's runners have no GPU: the GPU tests (`.github/workflows/test-gpu.yaml`) run on a T4 through [cirun](https://cirun.io)
+GitHub’s runners have no GPU: the GPU tests (`.github/workflows/test-gpu.yaml`) run on a T4 through [cirun](https://cirun.io)
 for pushes to main, weekly, and for pull requests a maintainer labels `run-gpu-ci` (or `skip-gpu-ci`), which is removed
 after a run.
 
@@ -245,8 +236,8 @@ after a run.
 
 ### Updating the version number
 
-The version number comes from the release's git tag (with [hatch-vcs][]), so it isn't set in `pyproject.toml`.
-Add the release's changes to its notes in `docs/release-notes/` first (starting from `blank.md`, and listed in
+The version number comes from the release’s git tag (with [hatch-vcs][]), so it isn’t set in `pyproject.toml`.
+Add the release’s changes to its notes in `docs/release-notes/` first (starting from `blank.md`, and listed in
 `index.md`), and pick the version following [Semantic Versioning][semver], in brief
 
 > Given a version number MAJOR.MINOR.PATCH, increment the:
@@ -258,7 +249,7 @@ Add the release's changes to its notes in `docs/release-notes/` first (starting 
 > Additional labels for pre-release and build metadata are available as extensions to the MAJOR.MINOR.PATCH format.
 
 Replace `the-future` with the release date in the release notes,
-commit and push your changes and navigate to the "Releases" page of this project on GitHub.
+commit and push your changes and navigate to the “Releases” page of this project on GitHub.
 Specify `vX.X.X` as a tag name and create a release.
 For more information, see [managing GitHub releases][].
 This will automatically create a git tag and trigger a Github workflow that creates a release on [PyPI][].
@@ -318,7 +309,6 @@ please check out [this feature request][issue-render-notebooks] in the `cookiecu
 hatch run docs:build
 hatch run docs:open
 ```
-
 ::::
 
 ::::{tab-item} uv
@@ -329,7 +319,6 @@ cd docs
 uv run sphinx-build -M html . _build -W
 (xdg-)open _build/html/index.html
 ```
-
 ::::
 
 ::::{tab-item} Pip
@@ -341,6 +330,5 @@ cd docs
 sphinx-build -M html . _build -W
 (xdg-)open _build/html/index.html
 ```
-
 ::::
 :::::

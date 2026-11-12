@@ -6,40 +6,40 @@
 .. module:: zarr_kvikio
 
 .. autosummary::
-    :toctree: generated
+   :toctree: generated
 
-    enable
-    dask.enable
-    release_memory
+   enable
+   dask.enable
+   release_memory
 ```
 
 ```{eval-rst}
 .. autosummary::
-    :toctree: generated
-    :template: base
+   :toctree: generated
+   :template: base
 
-    KvikioCodecPipeline
+   KvikioCodecPipeline
 ```
 
 ## Checking an installation and arrays
 
 ```{eval-rst}
 .. autosummary::
-    :toctree: generated
+   :toctree: generated
 
-    available
-    require
-    check
-    describe
+   available
+   require
+   check
+   describe
 ```
 
 ## Writing stores for the GPU
 
 ```{eval-rst}
 .. autosummary::
-    :toctree: generated
+   :toctree: generated
 
-    convert_array
-    layout
-    cpu_pipeline
+   convert_array
+   layout
+   cpu_pipeline
 ```
