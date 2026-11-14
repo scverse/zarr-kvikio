@@ -305,9 +305,14 @@ def test_other_out_dtype_falls_back(tmp_path, fast_path_calls, host_pipeline, dt
 
 @pytest.mark.parametrize("host_pipeline", HOST_PIPELINES)
 @pytest.mark.parametrize("shards", [None, (150,)])
-def test_memory_store_falls_back(fast_path_calls, host_pipeline, shards):
+@pytest.mark.parametrize("zip_store", [False, True])  # (without synchronous IO)
+def test_other_stores_fall_back(tmp_path, fast_path_calls, host_pipeline, shards, zip_store):
     data = rng.random(300).astype("float32")
-    store = zarr.storage.MemoryStore()
+    store = (
+        zarr.storage.ZipStore(tmp_path / "a.zip", mode="a")
+        if zip_store
+        else zarr.storage.MemoryStore()
+    )
     with zarr.config.set(host_pipeline), gpu_pipeline():
         arr = zarr.create_array(
             store, shape=data.shape, dtype=data.dtype, chunks=(50,), shards=shards

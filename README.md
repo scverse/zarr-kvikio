@@ -221,7 +221,7 @@ Store layout: zstd level 3, sharded with 1 MiB inner chunks and 128 inner chunks
 
 ## Limitations
 
-- Local files only (`LocalStore`); remote and in-memory stores use the fallback.
+- Local files only (`LocalStore`); remote and in-memory stores are read as with `zarr.config.enable_gpu()`.
 - zstd (without checksum) or no compression only. Blosc, which many existing stores use, cannot be decoded by nvCOMP.
 - nvCOMP's Python API costs a few milliseconds per `decode` call and blocks the calling thread,
   so reads, decoding and copies do not yet overlap across CUDA streams the way a C-API implementation can
