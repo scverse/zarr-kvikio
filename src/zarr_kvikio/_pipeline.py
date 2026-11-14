@@ -456,9 +456,7 @@ def release_memory() -> None:
                 # when a synchronize above failed (e.g. after a CUDA error). Otherwise no decode
                 # runs now (new ones wait for the lock), and `_pool` sets it again.
                 if _pinned_pool:
-                    import nvidia.nvcomp as nv
-
-                    nv.set_pinned_allocator(None)
+                    _nvcomp().set_pinned_allocator(None)
                     _pinned_pool.pop().free_all_blocks()
 
 
@@ -560,11 +558,26 @@ class _FileBudget:
 _open_files = _FileBudget()
 
 
+def _nvcomp() -> Any:
+    """`nvidia.nvcomp`, imported without breaking a later `import cudf`.
+
+    nvCOMP's `__init__` deletes the `libnvcomp` attribute of the `nvidia` package but leaves the
+    module in `sys.modules`, so libcudf's loader (`import nvidia.libnvcomp`, then
+    `nvidia.libnvcomp.load_library()`) raises AttributeError unless it is put back.
+    """
+    import nvidia
+    import nvidia.nvcomp as nv  # (`as` works even while another thread's import finishes)
+
+    if (lib := sys.modules.get("nvidia.libnvcomp")) is not None:
+        nvidia.libnvcomp = lib
+    return nv
+
+
 def _pool(device_id: int) -> queue.Queue[tuple[Any, Any] | None]:
     """The pool of nvCOMP zstd codecs for a device, each with the CUDA stream it runs on."""
     import cupy as cp
-    import nvidia.nvcomp as nv
 
+    nv = _nvcomp()
     with _pools_lock:
         if device_id not in _pools:
             # (with no codecs, decodes would wait for one forever)
@@ -621,8 +634,7 @@ def _decode_into(
 
     Unless `check` is False (see `_check_frame_sizes`), raises if a frame decodes to another size.
     """
-    import nvidia.nvcomp as nv
-
+    nv = _nvcomp()
     limit = _max_decode_bytes()
     groups: list[tuple[int, int]] = []
     start = size = 0
