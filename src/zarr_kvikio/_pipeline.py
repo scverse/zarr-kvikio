@@ -18,10 +18,10 @@ and copied to the GPU at once, unless they decode at least that many from many s
 
 Everything else works with any store: reads into host buffers and writes of host buffers are
 delegated to a host pipeline (``kvikio.host_pipeline``, e.g. zarrs, else zarr's
-:class:`~zarr.core.codec_pipeline.FusedCodecPipeline`), and reads into GPU buffers the GPU can't
-decode (e.g. blosc-compressed or remote chunks, or structured data types) are decoded by it on the
-host and then copied. Writes of GPU buffers use zarr's
-:class:`~zarr.core.codec_pipeline.BatchedCodecPipeline`.
+:class:`~zarr.core.codec_pipeline.FusedCodecPipeline`), and local reads into GPU buffers the GPU
+can't decode (e.g. blosc-compressed chunks or structured data types) are decoded by it on the host
+and then copied. Reads into GPU buffers from other stores (e.g. remote ones) and writes of GPU
+buffers use zarr's :class:`~zarr.core.codec_pipeline.BatchedCodecPipeline`.
 """
 
 from __future__ import annotations
@@ -176,8 +176,9 @@ class KvikioCodecPipeline(BatchedCodecPipeline):
     optionally sharded, into GPU buffers take the KvikIO/nvCOMP fast path.
     Reads into host buffers and writes of host buffers go to the pipeline in zarr's config
     ``kvikio.host_pipeline`` (e.g. zarrs), or else to zarr's
-    :class:`~zarr.core.codec_pipeline.FusedCodecPipeline`, which also decodes the reads into GPU
-    buffers that the GPU can't (copied afterwards). Writes of GPU buffers go to zarr's
+    :class:`~zarr.core.codec_pipeline.FusedCodecPipeline`, which also decodes the local reads into
+    GPU buffers that the GPU can't (copied afterwards). Other reads into GPU buffers (e.g. from
+    remote stores) and writes of GPU buffers go to zarr's
     :class:`~zarr.core.codec_pipeline.BatchedCodecPipeline`. So the pipeline works with any array.
 
     zarr finds it (as ``"zarr_kvikio.KvikioCodecPipeline"``) through an entry point.
@@ -225,10 +226,14 @@ class KvikioCodecPipeline(BatchedCodecPipeline):
             return await self._read_via_host(batch, out_arr, drop_axes)
         layout = self._layout
         paths = [_local_path(bg) for bg, *_ in batch]
+        if any(p is None for p in paths):
+            # not from local files (or from within a shard): as zarr reads into GPU buffers
+            # (decoding on the host needs host buffers within shards, which zarr only allows from
+            # stores with synchronous IO)
+            return await super().read(batch, out, drop_axes)
         # (zarr also takes an `out` of another dtype: `_read_via_host` casts into it)
         if (
             layout is None
-            or any(p is None for p in paths)
             or any(spec.dtype.to_native_dtype() != out_arr.dtype for _, spec, *_ in batch)
             or (
                 layout.compressed
