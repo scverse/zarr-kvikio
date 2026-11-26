@@ -133,7 +133,7 @@ def convert_array(
             if validate is not None:
                 validate(block, s, e)
             values = block.astype(dtype, copy=False)
-            if values.dtype != block.dtype and not np.array_equal(values, block, equal_nan=True):
+            if values.dtype != block.dtype and not _values_equal(block, values):
                 msg = f"`{label}` has values in [{s}, {e}) that {dtype} cannot hold."
                 raise ValueError(msg)
             dx[s:e] = values
@@ -141,7 +141,7 @@ def convert_array(
 
         def check(k: int) -> int:
             s, e = k * step, min(n_rows, (k + 1) * step)
-            if not np.array_equal(dx[s:e], src[s:e], equal_nan=True):
+            if not _values_equal(np.asarray(src[s:e]), np.asarray(dx[s:e])):
                 msg = f"The converted `{label}` differs from the source in [{s}, {e})."
                 raise AssertionError(msg)
             return (e - s) * per_row
@@ -194,6 +194,25 @@ def cpu_pipeline() -> ConfigSet:
 
 _HOST_BUFFERS = {"buffer": "zarr.buffer.cpu.Buffer", "ndbuffer": "zarr.buffer.cpu.NDBuffer"}
 _LOCK = threading.Lock()
+
+
+def _values_equal(original: np.ndarray, converted: np.ndarray) -> bool:
+    if original.shape != converted.shape:
+        return False
+    # Bound comparison and cast temporaries, even for a single wide row.
+    blocks = np.nditer(
+        (original, converted), flags=["buffered", "external_loop", "zerosize_ok"], buffersize=65_536
+    )
+    with np.errstate(invalid="ignore", over="ignore"):
+        for src, dst in blocks:
+            if not np.array_equal(src, dst, equal_nan=True):
+                return False
+            # Mixed integer/float comparisons can round the integer. Check its original dtype too.
+            if src.dtype != dst.dtype and not np.array_equal(
+                src, dst.astype(src.dtype), equal_nan=True
+            ):
+                return False
+    return True
 
 
 def _check_ndim(shape: tuple[int, ...]) -> None:

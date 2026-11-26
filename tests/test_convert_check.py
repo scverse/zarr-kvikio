@@ -61,6 +61,36 @@ def test_convert_array_dtype(tmp_path):
         zarr_kvikio.convert_array(large, dst, "large", dtype=np.uint16)
 
 
+@pytest.mark.parametrize("verify", [False, True])
+@pytest.mark.parametrize(
+    ("src_dtype", "dst_dtype", "value"),
+    [
+        (np.int64, np.float64, 2**53 + 1),
+        (np.uint64, np.float64, 2**53 + 1),
+        (np.int64, np.float32, 2**24 + 1),
+        (np.int64, np.uint64, -1),
+        (np.uint64, np.int64, 2**63),
+    ],
+)
+def test_convert_array_rejects_lossy_cast(tmp_path, src_dtype, dst_dtype, value, verify):
+    # Only the last value of a wide row is lossy, after several comparison blocks.
+    data = np.zeros((1, 131_073), dtype=src_dtype)
+    data[0, -1] = value
+    src = blosc_array(tmp_path / "src.zarr", data)
+    dst = zarr.open_group(tmp_path / "dst.zarr", mode="w")
+    with pytest.raises(ValueError, match="cannot hold"):
+        zarr_kvikio.convert_array(src, dst, "x", dtype=dst_dtype, verify=verify)
+
+
+@pytest.mark.parametrize("src_dtype", [np.int64, np.uint64])
+def test_convert_array_accepts_exact_large_integer(tmp_path, src_dtype):
+    src = blosc_array(tmp_path / "src.zarr", np.array([2**53], dtype=src_dtype))
+    dst = zarr.open_group(tmp_path / "dst.zarr", mode="w")
+    new = zarr_kvikio.convert_array(src, dst, "x", dtype=np.float64)
+    assert new.dtype == np.float64
+    assert int(new[0]) == 2**53
+
+
 def test_convert_array_validate(tmp_path):
     src = blosc_array(tmp_path / "src.zarr", np.arange(1000, dtype=np.int64))
     dst = zarr.open_group(tmp_path / "dst.zarr", mode="w")
