@@ -54,16 +54,9 @@ test = [ "coverage>=7.10", "distributed", "pytest", "pytest-cov", "zarrs" ]  # (
 doc = [
   "ipykernel",
   "ipython",
-  "myst-nb>=1.1",
-  "scverse-misc[sphinx]>=0.1.2",
-  "sphinx>=8.1",
+  "scverse-doc[full]>=0.5",
   "sphinx-autodoc-typehints",
-  "sphinx-book-theme>=1",
-  "sphinx-copybutton",
-  "sphinx-design",
   "sphinxcontrib-bibtex>=1",
-  "sphinxcontrib-katex",
-  "sphinxext-opengraph",
 ]
 typecheck = [ "mypy" ]
 

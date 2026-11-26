@@ -237,8 +237,8 @@ after a run.
 ### Updating the version number
 
 The version number comes from the release’s git tag (with [hatch-vcs][]), so it isn’t set in `pyproject.toml`.
-Add the release’s changes to its notes in `docs/release-notes/` first (starting from `blank.md`, and listed in
-`index.md`), and pick the version following [Semantic Versioning][semver], in brief
+Start the release’s notes by copying `docs/release-notes/blank.md` to a file named for the version (e.g. `0.1.0.md`).
+The release notes index picks up version files automatically. Choose the version following [Semantic Versioning][semver], in brief
 
 > Given a version number MAJOR.MINOR.PATCH, increment the:
 >
