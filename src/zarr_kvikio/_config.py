@@ -56,11 +56,11 @@ def enable() -> ConfigSet:
     set). As with ``zarr.config.set``, nested calls must be undone in reverse order, also
     relative to :func:`zarr_kvikio.dask.enable` in this process.
 
-    The GPU decodes chunks that are zstd-compressed (or uncompressed), ideally sharded with
-    small inner chunks (see :func:`convert_array` and :func:`describe`). Other chunks
-    (e.g. blosc-compressed) are decompressed on the CPU, with ``kvikio.host_pipeline`` or else
-    zarr's fused pipeline, and then copied to the GPU, so any array can be read. For a Dask
-    cluster, use :func:`zarr_kvikio.dask.enable`.
+    Local Zarr v3 arrays with uncompressed or zstd-compressed numeric chunks can use the
+    accelerated path (see :func:`describe` and :func:`convert_array`). Other local codecs,
+    e.g. Blosc, use the host pipeline. For numeric arrays on remote stores, Zarr's
+    :class:`~zarr.core.codec_pipeline.BatchedCodecPipeline` reads into GPU buffers.
+    To enable the pipeline on Dask workers, use :func:`zarr_kvikio.dask.enable`.
     """
     require()
     return zarr.config.set(

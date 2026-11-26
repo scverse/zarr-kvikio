@@ -1,10 +1,24 @@
 # zarr-kvikio
 
-zarr-kvikio reads local Zarr v3 arrays into CuPy arrays. It uses [KvikIO](https://github.com/rapidsai/kvikio) for I/O
-and [nvCOMP](https://developer.nvidia.com/nvcomp) to decompress Zstandard chunks on the GPU. Other codecs fall back to CPU decoding.
+zarr-kvikio is a Zarr-Python codec pipeline that reads numeric arrays into CuPy arrays.
+For local Zarr v3 arrays it accelerates uncompressed reads and Zstandard decompression with
+[KvikIO](https://github.com/rapidsai/kvikio) and [nvCOMP](https://developer.nvidia.com/nvcomp).
+For remote arrays it uses Zarr’s standard GPU-buffer reads.
 
-[Install zarr-kvikio](installation.md) and [read your first array on the GPU](quickstart.md).
-The [user guide](usage.md) covers Dask workers, store layouts and performance tuning.
+After [installation](installation.md), select the pipeline and GPU buffers before opening an array.
+
+```python
+import zarr
+
+zarr.config.set({"codec_pipeline.path": "zarr_kvikio.KvikioCodecPipeline"})
+zarr.config.enable_gpu()
+array = zarr.open_array("data.zarr", mode="r")
+rows = array[:1024]  # cupy.ndarray
+```
+
+The [quick start](quickstart.md) shows how to enable GPU reads inside a `with` block and how to open a remote array.
+The user guide covers [supported stores](usage.md#supported-stores), [indexing](usage.md#indexing),
+[codec requirements](usage.md#what-takes-the-fast-path), and [configuration](usage.md#configuration).
 The [API reference](api.md) documents the pipeline and its Python helpers.
 
 ```{toctree}

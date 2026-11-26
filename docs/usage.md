@@ -2,19 +2,28 @@
 
 ## Select the pipeline
 
-Zarr discovers the installed codec pipeline by name. Any package can select it through Zarr’s configuration.
+Select `zarr_kvikio.KvikioCodecPipeline` by name in `zarr.config` before opening the array, as in the
+[configuration example](index.md). The {func}`zarr_kvikio.enable` helper selects the pipeline and GPU buffers together. Reads into host buffers use the configured [host pipeline](#configuration).
 
-```python
-import zarr
+## Supported stores
 
-zarr.config.set({"codec_pipeline.path": "zarr_kvikio.KvikioCodecPipeline"})
-zarr.config.enable_gpu()
-array = zarr.open_array("data.zarr", mode="r")
-rows = array[:1024]  # cupy.ndarray
-```
+Open the array with Zarr’s usual path, URL, or store object.
+For GPU reads of fixed-size numeric arrays, the store determines how the pipeline reads chunks.
 
-Reads into host buffers use the CPU, so the pipeline can stay selected in code that also reads into host memory.
-The [quick start](quickstart.md) shows how to use {func}`zarr_kvikio.enable` to select both the pipeline and GPU buffers.
+  | Zarr store                                         | How the pipeline reads into GPU memory                                                                                                                               |
+  | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+  | `LocalStore` (a directory on disk)                 | Eligible chunks use the [local fast path](#what-takes-the-fast-path). For other codec chains, the host pipeline decodes the chunks and copies the result to the GPU. |
+  | `FsspecStore` (e.g. S3 or HTTPS) and `ObjectStore` | Zarr’s `BatchedCodecPipeline` reads through the store and fills the GPU buffer, including for sharded arrays.                                                        |
+  | `ZipStore` and `MemoryStore`                       | These use the same Zarr GPU-buffer path as remote stores, even for a ZIP file on local disk.                                                                         |
+
+Remote reads support the same codecs and data types as [Zarr’s GPU buffers](https://zarr.readthedocs.io/en/stable/user-guide/gpu/).
+See the [remote read example](quickstart.md#read-a-remote-array) for backend setup.
+
+## Indexing
+
+GPU reads support integer indices, slices (including strides), orthogonal selections with `oindex`,
+and chunk selections with `blocks`. For example, `array.oindex[[0, 3], :]` reads rows 0 and 3 of a 2-D array.
+Zarr’s coordinate indexing (`vindex`) requires a host buffer.
 
 ## Read with Dask
 
@@ -64,10 +73,10 @@ or environment variables, which zarr reads when it is imported (e.g. `ZARR_KVIKI
 the settings of the process it runs in as they are then, except for `kvikio.decoders` and `kvikio.host_pipeline`
 (see below). Invalid values raise a `ValueError` naming the key.
 
-- **`kvikio.host_pipeline`** (default: zarr's `FusedCodecPipeline`): the codec pipeline for reads into host buffers,
-  writes of host buffers, and decoding what the GPU can't on the CPU, e.g. `"zarrs.ZarrsCodecPipeline"` (with zarrs'
-  own options). If it isn't set, `enable()` and `dask.enable()` set it to the pipeline zarr was configured with
-  (e.g. zarrs).
+- **`kvikio.host_pipeline`** handles host-buffer reads and writes, and local reads that need host decoding (e.g. Blosc).
+  The default is Zarr’s `FusedCodecPipeline`. If you have selected a different pipeline such as
+  [zarrs-python](https://zarrs-python.readthedocs.io/en/latest/), `enable()` and `dask.enable()`
+  preserve it for host operations unless you set `kvikio.host_pipeline` explicitly.
   An opened array reads it when it first needs that pipeline, and keeps it (copies sent to Dask workers read it there).
 - **`kvikio.num_threads`** (default 8, or `KVIKIO_NTHREADS` if that is set): the threads KvikIO reads with, a setting
   of the whole process that KvikIO sets to 1 by default. Before each read with KvikIO, KvikIO's thread count is set to
@@ -122,10 +131,9 @@ A read takes the fast path, which reads the stored bytes with KvikIO (or into pi
   (index codecs `bytes` + optional `crc32c`, index at the start or end), and
 - its (inner) chunks are smaller than 2 GiB if zstd-compressed (nvCOMP's limit).
 
-Everything else, including reads into host buffers and writes of host buffers, is handled by `kvikio.host_pipeline`
-(e.g. zarrs), or else zarr’s `FusedCodecPipeline`. Reads into GPU buffers of arrays the GPU can’t decode (e.g. blosc,
-or structured data types), or into GPU buffers of another data type than the array’s, are decoded on the CPU and then
-copied. Writes of GPU buffers (every write while `enable()` is active) go through zarr’s `BatchedCodecPipeline`.
+On a `LocalStore`, `ZstdCodec(checksum=False)` can use nvCOMP. `BloscCodec(cname="zstd")` uses the host pipeline
+because its chunks are wrapped in the Blosc format. The host pipeline also handles data types outside the fixed-size
+numeric types and local reads that cast to a different output dtype. GPU-buffer writes use Zarr’s `BatchedCodecPipeline`.
 
 How a fast read works:
 
@@ -196,12 +204,9 @@ Store layout: zstd level 3, sharded with 1 MiB inner chunks and 128 inner chunks
 
 ## Limitations
 
-- Local files only (`LocalStore`); remote and in-memory stores use the fallback.
-- zstd (without checksum) or no compression only. Blosc, which many existing stores use, cannot be decoded by nvCOMP.
-- nvCOMP's Python API costs a few milliseconds per `decode` call and blocks the calling thread,
-  so reads, decoding and copies do not yet overlap across CUDA streams the way a C-API implementation can
-  (see Tom Augspurger's [GPU-accelerated Zarr](https://tomaugspurger.net/posts/gpu-accelerated-zarr/)).
-- zarr's `vindex` (coordinate selection) does not support GPU buffers with any pipeline.
+nvCOMP’s Python API costs a few milliseconds per `decode` call and blocks the calling thread,
+so reads, decoding and copies do not yet overlap across CUDA streams the way a C-API implementation can
+(see Tom Augspurger’s [GPU-accelerated Zarr](https://tomaugspurger.net/posts/gpu-accelerated-zarr/)).
 
 ## Compatibility
 
