@@ -73,7 +73,10 @@ def test_convert_array_dtype(tmp_path):
     ],
 )
 def test_convert_array_rejects_lossy_cast(tmp_path, src_dtype, dst_dtype, value, verify):
-    src = blosc_array(tmp_path / "src.zarr", np.array([value], dtype=src_dtype))
+    # Only the last value of a wide row is lossy, after several comparison blocks.
+    data = np.zeros((1, 131_073), dtype=src_dtype)
+    data[0, -1] = value
+    src = blosc_array(tmp_path / "src.zarr", data)
     dst = zarr.open_group(tmp_path / "dst.zarr", mode="w")
     with pytest.raises(ValueError, match="cannot hold"):
         zarr_kvikio.convert_array(src, dst, "x", dtype=dst_dtype, verify=verify)

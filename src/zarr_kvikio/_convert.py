@@ -141,7 +141,7 @@ def convert_array(
 
         def check(k: int) -> int:
             s, e = k * step, min(n_rows, (k + 1) * step)
-            if not _values_equal(src[s:e], dx[s:e]):
+            if not _values_equal(np.asarray(src[s:e]), np.asarray(dx[s:e])):
                 msg = f"The converted `{label}` differs from the source in [{s}, {e})."
                 raise AssertionError(msg)
             return (e - s) * per_row
@@ -197,13 +197,22 @@ _LOCK = threading.Lock()
 
 
 def _values_equal(original: np.ndarray, converted: np.ndarray) -> bool:
-    # Mixed integer/float comparisons can round the integer: also compare in its original dtype.
-    if not np.array_equal(original, converted, equal_nan=True):
+    if original.shape != converted.shape:
         return False
-    if original.dtype == converted.dtype:
-        return True
+    # Bound comparison and cast temporaries, even for a single wide row.
+    blocks = np.nditer(
+        (original, converted), flags=["buffered", "external_loop", "zerosize_ok"], buffersize=65_536
+    )
     with np.errstate(invalid="ignore", over="ignore"):
-        return np.array_equal(original, converted.astype(original.dtype), equal_nan=True)
+        for src, dst in blocks:
+            if not np.array_equal(src, dst, equal_nan=True):
+                return False
+            # Mixed integer/float comparisons can round the integer. Check its original dtype too.
+            if src.dtype != dst.dtype and not np.array_equal(
+                src, dst.astype(src.dtype), equal_nan=True
+            ):
+                return False
+    return True
 
 
 def _check_ndim(shape: tuple[int, ...]) -> None:
