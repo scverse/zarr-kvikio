@@ -522,7 +522,7 @@ def test_contiguous_reads_close_files_before_decoding(tmp_path, monkeypatch, fet
     """The shard files (and their file descriptor budget) are needed only until they are read."""
     zarr.config.set({"kvikio.min_bytes": 0, "kvikio.fetch": fetch})
     monkeypatch.setattr(_pipeline, "_open_files", budget := _pipeline._FileBudget(64))
-    decode, held = _pipeline._decode_into, []
+    decode, held = _pipeline._decode_contiguous, []
 
     def spy(*args, **kwargs):
         files = 0
@@ -532,7 +532,7 @@ def test_contiguous_reads_close_files_before_decoding(tmp_path, monkeypatch, fet
         held.append((budget._used, files))
         return decode(*args, **kwargs)
 
-    monkeypatch.setattr(_pipeline, "_decode_into", spy)
+    monkeypatch.setattr(_pipeline, "_decode_contiguous", spy)
     data = rng.random(4000).astype("float32")
     write(tmp_path / "a.zarr", data, (25,), shards=(1000,))
     np.testing.assert_array_equal(read_gpu(tmp_path / "a.zarr", slice(10, 3990)), data[10:3990])
@@ -709,3 +709,88 @@ if {fault}:
     assert proc.returncode == 0, proc.stderr
     # (Python 3.12 puts a colon after "callback")
     assert bool(re.search("in atexit callback:? <function release_memory", proc.stderr)) == fault
+
+
+@pytest.mark.parametrize("length,available", [(31, True), (32, False)])
+def test_small_or_unsupported_zstd_batches_use_codec(monkeypatch, length, available):
+    called = []
+    monkeypatch.setattr(_pipeline, "_check_frame_sizes", lambda *args: None)
+    monkeypatch.setattr(
+        _pipeline._zstd, "batch_api", lambda device_id: object() if available else None
+    )
+    monkeypatch.setattr(_pipeline, "_decode_into", lambda *args, **kwargs: called.append(args))
+    starts = np.arange(length, dtype=np.int64)
+    _pipeline._decode_contiguous(
+        SimpleNamespace(data=SimpleNamespace(ptr=1000)),
+        starts,
+        np.ones(length),
+        starts + 2000,
+        8,
+        object(),
+        SimpleNamespace(id=0),
+    )
+    src, dst, sizes, *_ = called.pop()
+    assert len(src) == len(dst) == length and sizes == [8] * length
+    assert src[-1].__cuda_array_interface__["data"][0] == 1000 + length - 1
+
+
+@needs_gpu
+def test_batched_zstd_checks_actual_lengths_and_returns_slot(monkeypatch):
+    from zarr_kvikio import _zstd
+
+    device = cp.cuda.Device()
+    if _zstd.batch_api(device.id) is None:
+        pytest.skip("needs the nvCOMP 5 batched Zstd C API")
+    zarr_kvikio.release_memory()
+    zarr.config.set({"kvikio.max_decode_bytes": 7 * 256, "kvikio.decoders": 1})
+    # Suppress the independent header check to exercise nvCOMP's actual length for a valid
+    # shorter frame. Successful decoding afterwards also requires returning the sole slot.
+    monkeypatch.setattr(_pipeline, "_check_frame_sizes", lambda *args: None)
+    stream = cp.cuda.Stream(non_blocking=True)
+    values = np.arange(256, dtype=np.uint8)
+    compressed = numcodecs.Zstd().encode(values)
+    with stream:
+        for short in (True, False):
+            frames = [compressed] * 32
+            if short:
+                frames[-1] = numcodecs.Zstd().encode(values[:-1])
+            sizes = np.array(list(map(len, frames)), np.int64)
+            starts = np.cumsum(sizes) - sizes
+            stored = cp.asarray(np.frombuffer(b"".join(frames), np.uint8))
+            out = cp.empty((len(frames), len(values)), cp.uint8)
+            targets = out.data.ptr + np.arange(len(frames)) * len(values)
+            args = stored, starts, sizes, targets, len(values), stream, device
+            if short:
+                with pytest.raises(ValueError, match="expected size"):
+                    _pipeline._decode_contiguous(*args)
+            else:
+                _pipeline._decode_contiguous(*args)
+                np.testing.assert_equal(out.get(), np.tile(values, (len(frames), 1)))
+    zarr_kvikio.release_memory()
+
+
+@pytest.mark.parametrize(
+    "version,input_alignment,available", [(4100, 1, False), (5200, 8, False), (5300, 1, True)]
+)
+def test_batched_zstd_requires_known_abi_and_unaligned_reads(
+    monkeypatch, version, input_alignment, available
+):
+    from zarr_kvikio import _zstd
+
+    def properties(result):
+        result[0] = version
+        return 0
+
+    def alignments(opts, result):
+        result[:] = [input_alignment, 1, 256]
+        return 0
+
+    lib = SimpleNamespace(
+        nvcompGetProperties=properties,
+        nvcompBatchedZstdDecompressGetRequiredAlignments=alignments,
+        nvcompBatchedZstdDecompressGetTempSizeAsync=lambda *args: 0,
+        nvcompBatchedZstdDecompressAsync=lambda *args: 0,
+    )
+    monkeypatch.setitem(sys.modules, "nvidia.libnvcomp", SimpleNamespace(load_library=lambda: lib))
+    # Query the resolver directly without changing cached results for real GPUs.
+    assert _zstd.batch_api.__wrapped__(0) is (lib if available else None)

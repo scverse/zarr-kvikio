@@ -53,6 +53,7 @@ from zarr.core.chunk_utils import fill_value_or_default
 from zarr.core.codec_pipeline import BatchedCodecPipeline, FusedCodecPipeline
 from zarr.storage import LocalStore, StorePath
 
+from . import _zstd
 from ._config import HOST_PIPELINE_KEY, ZARR_DEFAULT_PIPELINE, require
 
 if TYPE_CHECKING:
@@ -604,6 +605,14 @@ def _pool(device_id: int) -> queue.Queue[tuple[Any, Any] | None]:
         return _pools[device_id]
 
 
+def _take_decoder(device_id: int) -> tuple[queue.Queue, tuple[Any, Any]]:
+    pool = _pool(device_id)
+    while (item := pool.get()) is None:  # Release dropped this pool while we were waiting.
+        pool.put(None)
+        pool = _pool(device_id)
+    return pool, item
+
+
 def _stream(device_id: int) -> Any:
     """A per-thread, per-device CUDA stream, after the work queued on the default stream so far."""
     import cupy as cp
@@ -649,10 +658,7 @@ def _decode_into(
             start, size = i, 0
         size += n
     groups.append((start, len(sizes)))
-    pool = _pool(device.id)
-    while (item := pool.get()) is None:  # the pool was released: pass that on, use the new one
-        pool.put(None)
-        pool = _pool(device.id)
+    pool, item = _take_decoder(device.id)
     codec, codec_stream = item
     del item
     decoded: list[Any] = []
@@ -962,20 +968,51 @@ def _read_gpu_contiguous(
             plan.targets,
             temp.data.ptr + (-1 - plan.targets) * chunk_bytes,
         )
-        src_ptrs = (stored.data.ptr + positions).tolist()
-        _decode_into(
-            [_DevicePtr(p, s) for p, s in zip(src_ptrs, plan.sizes.tolist(), strict=True)],
-            [_DevicePtr(int(t), chunk_bytes) for t in targets.tolist()],
-            [chunk_bytes] * len(src_ptrs),
-            stream,
-            device,
-            check=False,
-        )
-        _check_frame_sizes(stored, positions, chunk_bytes)
+        _decode_contiguous(stored, positions, plan.sizes, targets, chunk_bytes, stream, device)
         for k, (a, b, out_a, out_b) in enumerate(plan.copies):
             out[out_a:out_b] = temp[k * n + a : k * n + b]
         stream.synchronize()
     return tuple(GetResult(status="present") for _ in batch)
+
+
+def _decode_contiguous(
+    stored: Any,
+    positions: np.ndarray,
+    sizes: np.ndarray,
+    targets: np.ndarray,
+    frame_bytes: int,
+    stream: Any,
+    device: Any,
+) -> None:
+    _check_frame_sizes(stored, positions, frame_bytes)
+    sources = stored.data.ptr + positions
+    # At larger frame counts, building a Python source and destination object per frame
+    # costs more than uploading the already planned pointer vectors.
+    if (
+        len(sizes) >= 32
+        and sizes.max() <= _NVCOMP_MAX_FRAME
+        and (lib := _zstd.batch_api(device.id))
+    ):
+        pool, item = _take_decoder(device.id)
+        decode_stream = item[1]
+        try:
+            decode_stream.wait_event(stream.record())
+            with decode_stream:
+                _zstd.decode(
+                    lib, sources, sizes, targets, frame_bytes, _max_decode_bytes(), decode_stream
+                )
+        finally:
+            pool.put(item)
+            del item  # Keep nvCOMP objects out of exception tracebacks after release_memory().
+    else:
+        _decode_into(
+            [_DevicePtr(p, s) for p, s in zip(sources.tolist(), sizes.tolist(), strict=True)],
+            [_DevicePtr(t, frame_bytes) for t in targets.tolist()],
+            [frame_bytes] * len(sizes),
+            stream,
+            device,
+            check=False,
+        )
 
 
 @dataclass(slots=True)
