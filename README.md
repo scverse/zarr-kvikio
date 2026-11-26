@@ -8,9 +8,10 @@
 [tests]: https://github.com/scverse/zarr-kvikio/actions/workflows/test.yaml
 [documentation]: https://zarr-kvikio.readthedocs.io/
 
-zarr-kvikio reads local Zarr v3 arrays into CuPy arrays using [KvikIO](https://github.com/rapidsai/kvikio)
-for I/O and [nvCOMP](https://developer.nvidia.com/nvcomp) for GPU decompression. It accelerates reads of
-Zstandard-compressed and uncompressed numeric chunks. Other codecs fall back to CPU decoding.
+zarr-kvikio is a [Zarr-Python](https://zarr.readthedocs.io/) codec pipeline for reading local and remote arrays into CuPy arrays.
+It accelerates reads of local Zarr v3 arrays with uncompressed or Zstandard-compressed numeric chunks using
+[KvikIO](https://github.com/rapidsai/kvikio) and [nvCOMP](https://developer.nvidia.com/nvcomp).
+Remote stores use Zarr’s standard GPU-buffer reads.
 
 ## Installation
 
