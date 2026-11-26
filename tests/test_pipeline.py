@@ -377,6 +377,18 @@ def test_release_memory(tmp_path, read_path):
     check(tmp_path / "a.zarr", slice(None))  # a new codec is created on demand
 
 
+def test_reads_keep_cudf_importable(tmp_path, read_path):
+    """nvCOMP's import deletes `nvidia.libnvcomp`, which libcudf's loader (`import cudf`) uses."""
+    if read_path == "host":
+        pytest.skip("host reads don't import nvCOMP")
+    pytest.importorskip("nvidia.libnvcomp")
+    write(tmp_path / "a.zarr", rng.random(100).astype("float32"), (10,))
+    check(tmp_path / "a.zarr", slice(None))
+    import nvidia.libnvcomp  # (as libcudf's loader does)
+
+    nvidia.libnvcomp.load_library()
+
+
 def test_enable(tmp_path, fast_path_calls):
     data = rng.random(1000).astype("float32")
     write(tmp_path / "a.zarr", data, (100,), shards=(500,))
