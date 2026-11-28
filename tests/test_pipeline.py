@@ -216,13 +216,24 @@ def test_missing_chunks(tmp_path, fast_path_calls, shards):
 
 
 @pytest.mark.parametrize("compressors", [ZSTD, ()], ids=["zstd", "raw"])
-def test_rectangular_dense_tiles(tmp_path, compressors):
+def test_rectangular_dense_tiles(tmp_path, compressors, read_path, monkeypatch):
+    groups = []
+    read_group = _pipeline._read_group
+
+    def read(*args):
+        groups.append(len(args[1]))
+        return read_group(*args)
+
+    monkeypatch.setattr(_pipeline, "_read_group", read)
+    zarr.config.set({"kvikio.max_decode_bytes": 256})
     data = rng.integers(0, 256, (43, 57), dtype=np.int32)
     data[8:12, 5:10] = -1  # An unwritten inner tile inside the selection.
     path = tmp_path / "tiles.zarr"
     write(path, data, (4, 5), shards=(24, 35), compressors=compressors, fill_value=-1)
     selection = np.s_[3:43, 2:57]  # Cropped first tile and padded last tile in both dimensions.
     np.testing.assert_array_equal(read_gpu(path, selection), data[selection])
+    if read_path == "gpu":
+        assert groups == [1] * 4  # Four shards, each larger than the temporary byte budget.
 
 
 def test_corrupt_index(tmp_path):

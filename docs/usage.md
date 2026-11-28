@@ -85,8 +85,8 @@ the settings of the process it runs in as they are then, except for `kvikio.deco
   nvCOMP's batched zstd decode needs about **3.2× the decoded size as scratch space**,
   and its codec keeps that memory for reuse, so this bounds the device memory held (≈3.4 GB by default).
   Each call also costs a few milliseconds, so a larger limit speeds up very large reads.
-  A read that decodes much more than it returns, e.g. a column of a large matrix (whose chunks it all decodes), does
-  so in parts holding about this many bytes (or twice its output's size, if larger) at once.
+  Sharded 2-D reads also use this limit to group temporary tile buffers. A single shard selection can exceed it.
+  Other reads can group up to twice the output size when that is larger.
 - **`kvikio.min_bytes`** (default 1 MiB): reads that return fewer bytes are read and zstd-decoded on the CPU by
   zarr-kvikio itself and copied to the GPU at once, unless they decode at least that many bytes from 32 or more chunks
   (e.g. a column of a matrix).

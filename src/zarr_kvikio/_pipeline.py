@@ -765,9 +765,10 @@ def _read_gpu(
     out: Any,
     drop_axes: tuple[int, ...],
 ) -> tuple[GetResult, ...]:
-    # (a read holds about its output in temporaries anyway, and its stored bytes; splitting one
-    # up makes its nvCOMP calls less efficient)
-    limit = max(_max_decode_bytes(), 2 * out.nbytes)
+    limit = _max_decode_bytes()
+    # A large dense output can occupy much of the device pool before its tiles are read.
+    if out.ndim != 2 or len(layout.inner_chunk_shape or ()) != 2:
+        limit = max(limit, 2 * out.nbytes)
     results: list[GetResult] = []
     with out.device as device:
         stream = _stream(device.id)
@@ -806,6 +807,9 @@ def _read_group(
     _fetch(pieces)
     if layout.compressed and pieces:
         _decode(pieces, stream, device)
+        # Decoding has synchronized. Release the stored bytes before assembling the output.
+        for p in pieces:
+            p.data = None
     else:
         for p in pieces:
             if p.data.size != p.target.size:
