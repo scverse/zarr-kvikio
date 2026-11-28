@@ -55,12 +55,19 @@ def decode(
 
     batch = min(len(sizes), max(1, limit // frame_bytes))
     required = ct.c_size_t()
-    status = lib.nvcompBatchedZstdDecompressGetTempSizeAsync(
-        batch, frame_bytes, _Options(), ct.byref(required), batch * frame_bytes
-    )
-    if status:
-        raise RuntimeError(f"nvCOMP Zstd workspace query returned {status}")
-    workspace = cp.empty(required.value + 255, cp.uint8)
+    while True:
+        status = lib.nvcompBatchedZstdDecompressGetTempSizeAsync(
+            batch, frame_bytes, _Options(), ct.byref(required), batch * frame_bytes
+        )
+        if status:
+            raise RuntimeError(f"nvCOMP Zstd workspace query returned {status}")
+        try:
+            workspace = cp.empty(required.value + 255, cp.uint8)
+            break
+        except MemoryError:
+            if batch == 1:
+                raise
+            batch //= 2
     scratch = (workspace.data.ptr + 255) & ~255
     try:
         for start in range(0, len(sizes), batch):

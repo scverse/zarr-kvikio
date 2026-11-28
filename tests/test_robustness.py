@@ -769,6 +769,66 @@ def test_batched_zstd_checks_actual_lengths_and_returns_slot(monkeypatch):
     zarr_kvikio.release_memory()
 
 
+@pytest.mark.parametrize("error,batches", [(MemoryError, [7, 3, 1]), (ValueError, [7])])
+def test_batched_zstd_workspace_allocation_failure(monkeypatch, error, batches):
+    from zarr_kvikio import _zstd
+
+    queries = []
+
+    def query(batch, *args):
+        queries.append(batch)
+        return 0
+
+    def fail(*args):
+        raise error("workspace unavailable")
+
+    monkeypatch.setitem(sys.modules, "cupy", SimpleNamespace(empty=fail, uint8=np.uint8))
+    frames = np.ones(7, np.uintp)
+    with pytest.raises(error, match="workspace unavailable"):
+        _zstd.decode(
+            SimpleNamespace(nvcompBatchedZstdDecompressGetTempSizeAsync=query),
+            frames,
+            frames,
+            frames,
+            1,
+            len(frames),
+            None,
+        )
+    assert queries == batches
+
+
+@needs_gpu
+def test_batched_zstd_decodes_every_frame_after_workspace_retry(monkeypatch):
+    from zarr_kvikio import _zstd
+
+    lib = _zstd.batch_api(cp.cuda.Device().id)
+    if lib is None:
+        pytest.skip("needs the nvCOMP 5 batched Zstd C API")
+    values = np.arange(7 * 32, dtype=np.uint8).reshape(7, 32)
+    frames = [numcodecs.Zstd().encode(row) for row in values]
+    sizes = np.array(list(map(len, frames)), dtype=np.uintp)
+    stored = cp.asarray(np.frombuffer(b"".join(frames), np.uint8))
+    sources = stored.data.ptr + sizes.cumsum() - sizes
+    out = cp.empty(values.shape, cp.uint8)
+    targets = out.data.ptr + np.arange(len(frames), dtype=np.uintp) * values.shape[1]
+    allocate = cp.empty
+    attempts = []
+
+    def constrained(shape, dtype=float, *args, **kwargs):
+        if dtype == cp.uint8 and isinstance(shape, int):
+            attempts.append(shape)
+            if len(attempts) == 1:
+                raise MemoryError("simulated constrained pool")
+        return allocate(shape, dtype, *args, **kwargs)
+
+    monkeypatch.setattr(cp, "empty", constrained)
+    _zstd.decode(
+        lib, sources, sizes, targets, values.shape[1], values.nbytes, cp.cuda.get_current_stream()
+    )
+    assert len(attempts) == 2
+    np.testing.assert_array_equal(out.get(), values)
+
+
 @pytest.mark.parametrize(
     "version,input_alignment,available", [(4100, 1, False), (5200, 8, False), (5300, 1, True)]
 )
