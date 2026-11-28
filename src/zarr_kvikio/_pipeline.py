@@ -1386,7 +1386,11 @@ def _scatter(entry: _Entry, out: Any, drop_axes: tuple[int, ...]) -> GetResult:
     for dest, index, src in entry.copies:
         dest[index] = src
     if entry.region is not None:
-        value = entry.region[_index(_shift(entry.chunk_selection, entry.origin), out)]
+        region = entry.region
+        if region.ndim == 4 and len(entry.origin) == 2:
+            nr, nc, rows, cols = region.shape
+            region = region.transpose(0, 2, 1, 3).reshape(nr * rows, nc * cols)
+        value = region[_index(_shift(entry.chunk_selection, entry.origin), out)]
         if drop_axes:
             value = value.squeeze(axis=drop_axes)
         out[_index(entry.out_selection, out)] = value
@@ -1501,6 +1505,25 @@ def _plan_region(
         int(hi) + c - o
         for hi, c, o in zip(starts.max(axis=0), stored_shape, entry.origin, strict=True)
     )
+    if (
+        _is_device_array(out)
+        and len(stored_shape) == 2
+        and all(isinstance(s, slice) and s.step == 1 for s in entry.chunk_selection)
+        and region_shape[1] > stored_shape[1]
+    ):
+        # A rectangular selection can decode directly into a single slab of contiguous tiles.
+        # Assemble the region in one copy after decoding, instead of one strided copy per tile.
+        rows, cols = stored_shape
+        tiles = entry.region = xp.empty(
+            (region_shape[0] // rows, region_shape[1] // cols, rows, cols), dtype
+        )
+        for (i, j), offset, nbytes in stored:
+            tile = tiles[(i - entry.origin[0]) // rows, (j - entry.origin[1]) // cols]
+            if (offset, nbytes) == (_MAX_UINT_64, _MAX_UINT_64):
+                tile[...] = fill
+            else:
+                pieces.append(_Piece(path, offset, nbytes, _as_bytes(tile)))
+        return
     entry.region = xp.empty(region_shape, dtype)
     for start, offset, nbytes in stored:
         local = tuple(

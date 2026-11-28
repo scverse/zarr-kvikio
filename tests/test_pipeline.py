@@ -215,6 +215,16 @@ def test_missing_chunks(tmp_path, fast_path_calls, shards):
     assert fast_path_calls
 
 
+@pytest.mark.parametrize("compressors", [ZSTD, ()], ids=["zstd", "raw"])
+def test_rectangular_dense_tiles(tmp_path, compressors):
+    data = rng.integers(0, 256, (43, 57), dtype=np.int32)
+    data[8:12, 5:10] = -1  # An unwritten inner tile inside the selection.
+    path = tmp_path / "tiles.zarr"
+    write(path, data, (4, 5), shards=(24, 35), compressors=compressors, fill_value=-1)
+    selection = np.s_[3:43, 2:57]  # Cropped first tile and padded last tile in both dimensions.
+    np.testing.assert_array_equal(read_gpu(path, selection), data[selection])
+
+
 def test_corrupt_index(tmp_path):
     data = rng.random(100).astype("float32")
     write(tmp_path / "a.zarr", data, (10,), shards=(50,))
